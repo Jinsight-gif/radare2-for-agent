@@ -14,7 +14,7 @@
 - 上游源码：radare2 **6.2.0**（tag `upstream-6.2.0`）
 - 开发分支：`r2-agent`
 - 旧 r3 封存：`legacy/r3` 分支 + `legacy/r3/` 目录 + tag `legacy/r3-v2.1.0`
-- 当前状态：**刚完成仓库重构与基线导入，尚未开始改 r2 源码**
+- 当前状态：**v1 开发方案已确认（`docs/PLAN-v1-agent-daemon.md`），尚未开始编码**
 - 本机参考 r2：`6.1.9+48`（旧 r3 的实测结论基于该版本；新开发以 6.2.0 源码为准）
 
 ## 项目目标
@@ -45,6 +45,7 @@
 AGENTS.md                     # AI agent 编码规范 + fork 项目约定
 PROJECT.md                    # 本文件：项目记忆/目标/原则/状态
 docs/
+  PLAN-v1-agent-daemon.md     # v1 开发方案（DSH goal mode 可执行蓝图）
   agent-daemon-design.md      # 内置无头守护进程/持久化交互模式的设计草案
   r3-legacy-summary.md        # r3 关键经验与可复用设计总结
 legacy/
@@ -62,22 +63,24 @@ legacy/
 - `master` / `v1.*` / `v2.0.0-dev`：旧 r3 历史分支，仅供追溯。
 - `upstream-6.2.0`：上游 radare2 6.2.0 导入标记。
 
-## 下一步路线（草稿）
+## 当前执行计划（v1）
 
-1. 阅读并梳理 r2 交互式循环相关源码：
-   - `libr/main/radare2.c`：主入口、批处理/交互切换、退出确认逻辑。
-   - `libr/core/core.c`：`r_core_prompt_loop()`。
-   - `libr/core/prompt.c`：命令提示符与行编辑。
-   - `libr/cons`：终端/输出抽象。
-   - `libr/core/project.c`：工程保存/恢复。
-2. 设计 r2 内置守护进程协议（Unix socket / stdio pipe / 远程）。
-3. 在源码中新增可选的 daemon 模式，先做最小可用闭环。
-4. 将 r3 的缓存、会话、看门狗、黑名单等经验迁移为 C 实现或配置。
-5. 补充自动化测试与验收脚本。
+- 按 `docs/PLAN-v1-agent-daemon.md` 执行，开发模式为 DSH goal mode。
+- v1 目标：实现 `r2 --daemon` + `r2 --send` 的单会话无头常驻闭环。
+- 任务顺序：G1 CLI 参数 → G2 Socket Server → G3 RCore 透传 → G4 管理命令 → G5 稳定性 → G6 测试与文档 → G7 验收。
+- 不进入 v1 范围：多会话、磁盘缓存、动态调试、e 配置持久化。
+
+### 开发前建议先读
+
+1. `docs/PLAN-v1-agent-daemon.md` — v1 开发方案。
+2. `docs/agent-daemon-design.md` — 架构草案。
+3. `docs/r3-legacy-summary.md` — r3 经验。
+4. `libr/main/radare2.c` — 主入口。
+5. `libr/core/core.c` 的 `r_core_prompt_loop()` — 交互命令循环。
 
 ## 给 AI agent 的注意事项
 
 - 不要修改 `legacy/` 下的旧 r3 代码；那是存档。
 - 所有新功能应尽可能在 `libr/` 和 `binr/radare2/` 内以可编译的 C 实现。
-- 改动前先读 `docs/agent-daemon-design.md` 和 `docs/r3-legacy-summary.md`。
+- 改动前先读 `docs/PLAN-v1-agent-daemon.md`、`docs/agent-daemon-design.md` 和 `docs/r3-legacy-summary.md`。
 - 提交前遵守 `AGENTS.md` 中的 radare2 官方编码规范、构建方式和提交信息约定。

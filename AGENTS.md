@@ -14,6 +14,7 @@
 ## 给 AI agent 的导航
 
 - `PROJECT.md` — 项目记忆、目标、原则、当前状态、路线图。
+- `docs/PLAN-v1-agent-daemon.md` — v1 开发方案（当前唯一开发执行蓝图）。
 - `docs/agent-daemon-design.md` — 内置“无头守护进程 + 持久化交互模式”的设计草案。
 - `docs/r3-legacy-summary.md` — r3 外包装沉淀的关键经验与可复用设计。
 - `legacy/r3/` — 旧 r3 完整源码、验收脚本和原始文档存档。
