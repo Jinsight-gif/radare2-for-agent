@@ -14,7 +14,7 @@
 - 上游源码：radare2 **6.2.0**（tag `upstream-6.2.0`）
 - 开发分支：`r2-agent`
 - 旧 r3 封存：`legacy/r3` 分支 + `legacy/r3/` 目录 + tag `legacy/r3-v2.1.0`
-- 当前状态：**v1 开发方案已确认（`docs/PLAN-v1-agent-daemon.md`），尚未开始编码**
+- 当前状态：**v1 基础闭环已实现（`--daemon` + `--send`），自动化验收脚本见 `test/acceptance-agent-daemon.sh`**
 - 本机参考 r2：`6.1.9+48`（旧 r3 的实测结论基于该版本；新开发以 6.2.0 源码为准）
 
 ## 项目目标

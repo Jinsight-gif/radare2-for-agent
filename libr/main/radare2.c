@@ -20,6 +20,7 @@
 #endif
 
 #include <r_core.h>
+#include "r2agent.h"
 
 static char *get_file_in_cur_dir(const char *filepath) {
 	filepath = r_file_basename (filepath);
@@ -240,6 +241,14 @@ static int main_help(int line) {
 	if (line != 1) {
 		printf (
 			" --           run radare2 without opening any file\n"
+			" --daemon     start headless agent daemon\n"
+			" --send cmd   send a command to the running agent daemon\n"
+			" --socket p   agent unix socket path (default /tmp/r2-agent.sock or $R2_AGENT_SOCK)\n"
+			" --log p      daemon log path (default /tmp/r2-agent.log)\n"
+			" --json       request JSON envelope from agent daemon\n"
+			" --timeout n  client timeout in seconds (default 30)\n"
+			" --foreground run agent daemon in foreground\n"
+			" --help       show this help message\n"
 			" -            same as 'r2 malloc://512'\n"
 			" =            read file from stdin (use -i and -c to run cmds)\n"
 			" -=           perform !=! command to run all commands remotely\n"
@@ -818,9 +827,71 @@ static void dp_write(RCore *core, const char *s) {
 
 #define OPTARGS "=012AjMCwxfF:Hhm:e:Enk:NdqQs:p:b:B:a:Lui:I:l:P:R:r:c:D:vVSzuXt"
 
+typedef struct {
+	bool daemon;
+	bool send;
+	const char *send_cmd;
+	const char *socket_path;
+	const char *log_path;
+	bool json;
+	bool foreground;
+	bool help;
+	int timeout;
+} R2AgentCli;
+
+static bool r2agent_cli_parse(int argc, const char **argv, R2AgentCli *cli) {
+	memset (cli, 0, sizeof (*cli));
+	cli->timeout = 30;
+	int i;
+	for (i = 1; i < argc; i++) {
+		const char *a = argv[i];
+		if (!strcmp (a, "--daemon")) {
+			cli->daemon = true;
+		} else if (!strcmp (a, "--send")) {
+			if (i + 1 >= argc) {
+				return false;
+			}
+			cli->send = true;
+			cli->send_cmd = argv[++i];
+		} else if (!strncmp (a, "--send=", 7)) {
+			cli->send = true;
+			cli->send_cmd = a + 7;
+		} else if (!strcmp (a, "--socket")) {
+			if (i + 1 >= argc) {
+				return false;
+			}
+			cli->socket_path = argv[++i];
+		} else if (!strncmp (a, "--socket=", 9)) {
+			cli->socket_path = a + 9;
+		} else if (!strcmp (a, "--log")) {
+			if (i + 1 >= argc) {
+				return false;
+			}
+			cli->log_path = argv[++i];
+		} else if (!strncmp (a, "--log=", 6)) {
+			cli->log_path = a + 6;
+		} else if (!strcmp (a, "--json")) {
+			cli->json = true;
+		} else if (!strcmp (a, "--foreground")) {
+			cli->foreground = true;
+		} else if (!strcmp (a, "--timeout")) {
+			if (i + 1 >= argc) {
+				return false;
+			}
+			cli->timeout = atoi (argv[++i]);
+		} else if (!strncmp (a, "--timeout=", 10)) {
+			cli->timeout = atoi (a + 10);
+		} else if (!strcmp (a, "--help")) {
+			cli->help = true;
+		}
+	}
+	return true;
+}
+
 R_API int r_main_radare2(int argc, const char **argv) {
 	int c, ret;
 	RMainRadare2 mr;
+	R2AgentCli cli;
 	mainr2_init (&mr);
 
 #ifdef __UNIX
@@ -848,6 +919,27 @@ R_API int r_main_radare2(int argc, const char **argv) {
 	if (argc < 2) {
 		mainr2_fini (&mr);
 		return main_help (1);
+	}
+	if (!r2agent_cli_parse (argc, argv, &cli)) {
+		R_LOG_ERROR ("Missing argument for r2agent option");
+		mainr2_fini (&mr);
+		return 1;
+	}
+	if (cli.help) {
+		int lines = cli.help? 2: 1;
+		mainr2_fini (&mr);
+		return main_help (lines);
+	}
+	if (cli.send) {
+		char *out = NULL;
+		int rc = r2agent_send (cli.send_cmd, cli.socket_path, cli.json, cli.timeout, &out);
+		if (out) {
+			printf ("%s", out);
+			fflush (stdout);
+			free (out);
+		}
+		mainr2_fini (&mr);
+		return rc? 1: 0;
 	}
 	// Pre-RCore commandline flags
 	RGetopt opt = { 0 };
@@ -919,6 +1011,17 @@ R_API int r_main_radare2(int argc, const char **argv) {
 	r->r_main_rax2 = r_main_rax2;
 	r->r_main_ravc2 = r_main_ravc2;
 	r->r_main_r2pm = r_main_r2pm;
+
+	if (cli.daemon) {
+		R2AgentOptions opts;
+		opts.socket_path = cli.socket_path;
+		opts.log_path = cli.log_path;
+		opts.foreground = cli.foreground;
+		opts.timeout = cli.timeout;
+		int rc = r2agent_start (r, &opts);
+		mainr2_fini (&mr);
+		return rc;
+	}
 
 	r->io->envprofile = mr.envprofile;
 

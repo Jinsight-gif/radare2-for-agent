@@ -18,6 +18,7 @@
 - `docs/agent-daemon-design.md` — 内置“无头守护进程 + 持久化交互模式”的设计草案。
 - `docs/r3-legacy-summary.md` — r3 外包装沉淀的关键经验与可复用设计。
 - `legacy/r3/` — 旧 r3 完整源码、验收脚本和原始文档存档。
+- `test/acceptance-agent-daemon.sh` — v1 无头守护进程自动化验收脚本。
 - 以下为 radare2 官方 AGENTS 编码规范，修改源码时必须遵守。
 
 ---

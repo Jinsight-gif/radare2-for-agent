@@ -1,6 +1,6 @@
 # radare2-for-agent v1 开发方案
 
-> 状态：已确认，待开发  
+> 状态：已确认，v1 基础闭环已实现
 > 目标读者：负责开发本功能的 AI agent（DSH goal mode）  
 > 基线：radare2 6.2.0 / 分支 `r2-agent`  
 > 开发模式：DSH goal mode（每个 Goal 有明确验收标准，完成一个再进下一个）
@@ -315,9 +315,9 @@ v, vv, ve, vp, vk, vvi
 
 ### Goal 1：CLI 参数预扫描
 
-- [ ] 在 `r_main_radare2()` 开头增加长选项识别。
-- [ ] 支持 `--daemon`、`--send`、`--socket`、`--log`、`--json`、`--timeout`、`--foreground`。
-- [ ] 不影响原有短选项行为。
+- [x] 在 `r_main_radare2()` 开头增加长选项识别。
+- [x] 支持 `--daemon`、`--send`、`--socket`、`--log`、`--json`、`--timeout`、`--foreground`。
+- [x] 不影响原有短选项行为。
 
 **验收**：
 - `r2 --help` 能看到新参数说明。
@@ -326,10 +326,10 @@ v, vv, ve, vp, vk, vvi
 
 ### Goal 2：Socket Server 最小闭环
 
-- [ ] 实现 `r2agent_start()`。
-- [ ] Unix socket bind/listen/accept。
-- [ ] 处理客户端连接，读取 NUL 请求，返回 NUL 响应。
-- [ ] 支持 `--foreground` 与后台 daemon 化。
+- [x] 实现 `r2agent_start()`。
+- [x] Unix socket bind/listen/accept。
+- [x] 处理客户端连接，读取 NUL 请求，返回 NUL 响应。
+- [x] 支持 `--foreground` 与后台 daemon 化。
 
 **验收**：
 - 用 `socat` 或 Python socket 发送 `{"cmd":"?e hello","json":false}\0`，能收到 `hello\0`。
@@ -338,9 +338,9 @@ v, vv, ve, vp, vk, vvi
 
 ### Goal 3：单会话 RCore 与命令透传
 
-- [ ] daemon 持有唯一 `RCore`。
-- [ ] 每条普通命令通过 `r_core_cmd_str()` 执行。
-- [ ] 分析状态跨多次客户端调用保留。
+- [x] daemon 持有唯一 `RCore`。
+- [x] 每条普通命令通过 `r_core_cmd_str()` 执行。
+- [x] 分析状态跨多次客户端调用保留。
 
 **验收**：
 - 客户端 1：`open /bin/ls`。
@@ -350,9 +350,9 @@ v, vv, ve, vp, vk, vvi
 
 ### Goal 4：管理命令
 
-- [ ] 实现 `open/close/status/quit`。
-- [ ] `open` 能打开文件并执行 `aaa`。
-- [ ] `status` 输出机器可读信息。
+- [x] 实现 `open/close/status/quit`。
+- [x] `open` 能打开文件并执行 `aaa`。
+- [x] `status` 输出机器可读信息。
 
 **验收**：
 - `open` 一个真实 ELF 后，`status` 能看到文件路径与已分析状态。
@@ -361,10 +361,10 @@ v, vv, ve, vp, vk, vvi
 
 ### Goal 5：稳定性
 
-- [ ] 实现 visual 黑名单。
-- [ ] 实现日志写入。
-- [ ] 实现协作式超时。
-- [ ] 实现错误响应。
+- [x] 实现 visual 黑名单。
+- [x] 实现日志写入。
+- [x] 实现协作式超时。
+- [x] 实现错误响应。
 
 **验收**：
 - 发送 `V` 返回黑名单错误，进程不挂。
@@ -373,9 +373,9 @@ v, vv, ve, vp, vk, vvi
 
 ### Goal 6：测试与文档
 
-- [ ] 写自动化验收脚本（可参考 `legacy/r3/tests/acceptance.sh`）。
-- [ ] 更新 `PROJECT.md`。
-- [ ] 更新 `AGENTS.md` 导航。
+- [x] 写自动化验收脚本（可参考 `legacy/r3/tests/acceptance.sh`）。
+- [x] 更新 `PROJECT.md`。
+- [x] 更新 `AGENTS.md` 导航。
 
 **验收**：
 - 新增测试在干净环境可重复通过。

@@ -6,8 +6,14 @@
 [![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/741/badge)](https://bestpractices.coreinfrastructure.org/projects/741) [![Build Status](https://scan.coverity.com/projects/416/badge.svg)](https://scan.coverity.com/projects/416) [![Discord](https://badgen.net/discord/members/YBey7CR9jf)](https://discord.gg/YBey7CR9jf)
 
 Current git `master` branch is `6.2.0`, next release will be `6.2.1`.
-> **radare2-for-agent fork**：本仓库目标是让 r2 原生支持 AI agent 所需的“无头 + 守护进程 + 持久化”交互模式。
-> 旧的 r3 外部包装器已归档到 `legacy/r3/`，项目说明见 `PROJECT.md`，设计草案见 `docs/agent-daemon-design.md`。
+
+> **radare2-for-agent fork**
+>
+> 本项目基于 [radare2](https://github.com/radareorg/radare2) 二次开发：
+> - 上游仓库：https://github.com/radareorg/radare2
+> - 初心：让 radare2 原生支持 AI agent 所需的“无头 + 守护进程 + 持久化”交互模式，使每次新开 bash 都能连接同一个常驻 r2 状态，不再依赖旧的外部 Python 包装器 r3。
+> - 旧 r3 外部包装器已归档到 `legacy/r3/`，仅作经验参考。
+> - 项目说明见 `PROJECT.md`，设计草案见 `docs/agent-daemon-design.md`，v1 开发方案见 `docs/PLAN-v1-agent-daemon.md`。
 
 
 ### Description
