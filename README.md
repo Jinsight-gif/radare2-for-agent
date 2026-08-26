@@ -15,6 +15,10 @@ Current git `master` branch is `6.2.0`, next release will be `6.2.1`.
 > - 旧 r3 外部包装器已归档到 `legacy/r3/`，仅作经验参考。
 > - 项目说明见 `PROJECT.md`，设计草案见 `docs/agent-daemon-design.md`，v1 开发方案见 `docs/PLAN-v1-agent-daemon.md`。
 
+**可选中文说明**：[README.zh-CN.md](README.zh-CN.md)
+
+> 🤖 **如果你是一个 AI Agent，请阅读 [README-AI.md](README-AI.md)**，里面有面向 AI 的安装、使用和能力边界说明。
+
 
 ### Description
 
