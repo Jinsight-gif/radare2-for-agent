@@ -1,3 +1,26 @@
+# radare2-for-agent — Agentic Coding Guidelines
+
+> 本仓库是 **radare2 fork**，目标是为 AI agent 逆向工作提供“无头 + 守护进程 + 持久化”的 r2 交互式命令模式。
+> 当前基线：**radare2 6.2.0**。旧的独立 r3 外包装已归档到 `legacy/r3/`，只保留代码与经验，不再作为主开发线。
+
+## 本 fork 的开发原则
+
+1. **直接在 radare2 源码内改**，不再用外部 Python 包装器替代交互模式。
+2. **交互式循环模式必须可无头化**：AI agent 每次新开 bash 都能连上同一个常驻 r2 状态。
+3. **命令行批处理模式与交互式循环模式要无缝配合**：保留 r2 原有的 `-q -c` 批处理能力，同时提供守护进程/持久化会话。
+4. **稳定性优先**：输出准确、不挂死、可超时自愈、可恢复现场；任何改动都不能破坏 r2 原有 CLI 使用方式。
+5. **旧 r3 经验只作参考**：r3 中的管道协议结论、缓存/会话/看门狗/黑名单等设计可以吸收，但不能把 r3 的 Python 外包装当成最终方案。
+
+## 给 AI agent 的导航
+
+- `PROJECT.md` — 项目记忆、目标、原则、当前状态、路线图。
+- `docs/agent-daemon-design.md` — 内置“无头守护进程 + 持久化交互模式”的设计草案。
+- `docs/r3-legacy-summary.md` — r3 外包装沉淀的关键经验与可复用设计。
+- `legacy/r3/` — 旧 r3 完整源码、验收脚本和原始文档存档。
+- 以下为 radare2 官方 AGENTS 编码规范，修改源码时必须遵守。
+
+---
+
 # Agentic Coding Guidelines for radare2
 
 radare2 is a modular reverse engineering framework.

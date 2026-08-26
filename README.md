@@ -6,6 +6,9 @@
 [![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/741/badge)](https://bestpractices.coreinfrastructure.org/projects/741) [![Build Status](https://scan.coverity.com/projects/416/badge.svg)](https://scan.coverity.com/projects/416) [![Discord](https://badgen.net/discord/members/YBey7CR9jf)](https://discord.gg/YBey7CR9jf)
 
 Current git `master` branch is `6.2.0`, next release will be `6.2.1`.
+> **radare2-for-agent fork**：本仓库目标是让 r2 原生支持 AI agent 所需的“无头 + 守护进程 + 持久化”交互模式。
+> 旧的 r3 外部包装器已归档到 `legacy/r3/`，项目说明见 `PROJECT.md`，设计草案见 `docs/agent-daemon-design.md`。
+
 
 ### Description
 

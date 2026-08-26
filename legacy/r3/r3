@@ -1,0 +1,2378 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""r3 — 给 AI agent 用的 radare2 常驻外包装（PLAN.md + PLAN-v1.1.md + PLAN-v1.2.md + PLAN-v1.3.md + PLAN-v2.md + PLAN-v2.1.md 的实现，v2.1.0）。
+
+架构：CLI（薄客户端，每次调用一个短命进程） → Unix socket（默认 /tmp/r3.sock，
+可用 R3_SOCK_PATH 覆盖）→ daemon（常驻后台，抱着 r2 -q0 管道进程不撒手）。
+
+== r2 管道协议（实测结论，r2 6.1.9，WSL Ubuntu-24.04；探针见 tests/probe_protocol*.py）==
+1. 裸 `r2 -q0`（不带文件参数）会立刻报 "ERROR: Missing file to open" 退出；
+   必须传 `-`（命令来自 stdin）才能保持常驻并保留 NUL 分帧协议。
+2. 启动后 r2 先在 stdout 发一个 NUL 表示就绪。
+3. 协议：stdin 写 `命令\n`，stdout 读到 NUL 即该命令输出结束。
+4. `-e scr.color=0 -e scr.interactive=0 -e scr.pager=` 均生效。
+5. 【关键事实】每条命令前后 r2 会在 **stderr**（不是 stdout）打 1~3 份鼠标禁用
+   序列 `\x1b[?1000;1002;1006;1015l`，且无 eval 可关（scr.mouse/cons.mouse 不存在，
+   TERM=dumb 也没用）。因此 daemon 把 stderr 单独引到 daemon.log，stdout 的命令
+   输出天然干净无 ANSI——不需要改写输出，传声筒保持透明（满足验收 D1）。
+6. `!sleep N` 在管道模式下精确阻塞 N 秒（看门狗 E2 靠它测试）。
+7. `Ps <路径>` 存到精确路径文件（不自动加 .r2 后缀，不预创建目录）；
+   `Po <路径>` 可恢复（会打一条 deprecation warning，走 stderr，无副作用）。
+   工程是 git 仓库形态，Ps 首次保存时 stderr 有 git 初始化 hint，同样无副作用。
+8. **scr.pager=cat** 是管道模式下长输出不挂 stdin 的关键——`scr.pager=`（空字符串）
+   在管道模式下实际不生效，会导致 `izz` 等长输出命令挂起等 stdin（8 秒超时才被
+   看门狗杀掉）。此外 r2 的 `o`（打开文件）会重置 pager 配置，daemon 每次 open
+   后必须重新发 `e scr.pager=cat`。
+
+== 与 PLAN.md 的事实类偏差（均为实测被迫，写在注释里存档）==
+* PLAN §3 设想 R3_BIGFILE_LIMIT / R3_CMD_TIMEOUT 仅靠"daemon 继承拉起时 CLI 的环境
+  变量"生效。但验收 C4/E2 的场景是 daemon 已在运行时用 `ENV=... r3 ...` 逐调用覆盖，
+  仅靠继承不生效。故 CLI 每次把这两个值放进请求 JSON（字段 timeout/bigfile），
+  daemon 优先采用请求值，其次用自身环境变量，最后用默认值。行为与 PLAN 意图一致。
+
+== v1.1 修复结论存档（PLAN-v1.1.md §3 实测要点精简，r2 6.1.9；验收驱动）==
+1. r2 的 `o 新文件` 只"再开一个并切过去"：旧文件 fd 不关、旧分析原封不动；
+   `aaa` 不清空既有分析；且没有可靠的全清命令（af- 无参只删当前函数、aa- 无效）。
+   → 换文件必须杀 r2 重开（决策 #9），"软重置"不可行。v1.2 改为"每文件一个
+   独立 r2 会话"后此问题自然消失（决策 #15 取代 #9 的重置需求）。
+2. `i~file` 输出 `file     /path`（首 token 为 "file"，路径取 split()[1]）；
+   `oqq` 只输出 fd 编号不能用于校验。r2 原样回显传入路径（不 realpath），
+   故校验基准用 open 时传入的 realpath。
+3. `Ps <路径>` 同时生成 <路径>（工程文件本体）与 <路径>.d（目录），缓存命中判定
+   用 isfile(<路径>) 正确；清理缓存时必须两者都删。
+4. 缓存旁写 `<工程>.meta.json` 归属校验（SHA-256，决策 #10）：v1 旧缓存无 meta
+   自动作废；meta 不符即删除脏缓存重新分析。
+5. 【v1.1 已废】JSON 输出以 { 或 [ 开头永不截断的启发式——v1.2 决策 #19 废除，
+   改为显式 `--json` 声明（保证不截断、不校验合法性，agent 自查 json.loads）。
+6. 沙箱友好（决策 #12）：R3_CACHE_DIR / R3_SOCK_PATH 可配置，R3_NO_CACHE=1 纯内存
+   模式不落盘；缓存目录不可写自动降级内存模式；daemon 日志文件打不开时
+   spawn 走 DEVNULL 而不是抛异常（否则 daemon 拉不起来）。
+   可写性用真实写探针（mkstemp+unlink）判断——makedirs(exist_ok=True) 对
+   "已存在但只读"的目录直接成功不抛异常（后修实测复现：~/.cache/r3 只读冷启动
+   open 报 PermissionError）；state.json 写盘失败静默降级内存模式，绝不冒泡成
+   daemon 内部错误。
+7. 【v1.1 已废】换文件重置 r2 时不能带状态恢复（start_r2(restore=False)）的
+   陷阱——v1.2 换文件不再杀 r2（切会话），此问题随决策 #15 消失。
+8. 缓存目录多级回退链（v1.1.x）：R3_CACHE_DIR（显式）→ XDG ~/.cache/r3 →
+   首次 open 文件目录下的 .r3cache/ → 纯内存兜底；逐级 probe_writable 选第一个
+   可写层。.r3cache 档锚定首次 open 文件的 dirname(realpath)（切换文件不换锚，
+   daemon 重启后随首次 open 重新锚定；daemon 启动时锚点未知只解析两级链，
+   首次 open 锚定后重解）。r2 工程内含 .git，选到 .r3cache 档时 open 输出
+   提示把 .r3cache/ 加入 .gitignore；status 输出生效路径/磁盘内存模式/回退原因。
+
+== v1.2 结论存档（PLAN-v1.2.md 决策 #15–#22；验收 K–O 组）==
+1. 【#15/#17】多会话 = 文件级会话池：`self.sessions: dict[sid, Session]`，
+   每个目标文件一个独立 r2 会话（e 配置与分析状态各自常驻，不再互杀）；
+   sid = sha256(realpath(文件)) 前 16 位十六进制（§3.5），同一文件永远同一 sid。
+   「当前会话」= self.active_sid：最近一次 open 或带 --session 的调用更新它。
+   无 --session 的调用落回 active_sid；单文件时行为与 v1.1 一致。
+   资源控制：MAX_SESSIONS=16，超限按 last_used 关最久未用的非活跃会话（LRU）。
+2. 【#16】CLI 加 `--session <路径或别名>`；协议 sid 字段启用（daemon 侧解析目标：
+   先 sid/精确路径匹配，再 basename 模糊匹配，冲突报错列候选）。兼容：旧客户端
+   硬编码 sid="default" 与显式缺失一律落回 active_sid。
+3. 【#15】新 action `list`（r3 sessions）/ `close`（r3 close [目标]，只释放 r2
+   不删磁盘缓存）。`cache_clean` 仍清全局磁盘缓存，与会话无关。
+4. 【#18】机器可读 = 结构化元信息，命令输出本体原样透传。status 加 --json
+   （daemon.pid/uptime/r2_version、active_session、sessions[]、cache.mode/path/
+   fallback_reason/projects/bytes）；sessions 支持 --json；resp 附
+   truncated/timed_out/rejected/error 元字段。
+5. 【#19】废除「输出以 { 或 [ 开头即 JSON」启发式，改显式 --json：
+   --json 承诺「不截断 + 原样完整」，不校验合法性（agent 自查 json.loads）；
+   不加 --json 一律按文本截断。--full 与 --json 正交（--json 隐含不截断）。
+6. 【#21】退出码：0 成功 / 1 连接或 daemon 故障 / 2 黑名单拒绝 / 3 超时 /
+   4 截断（截断发生时覆盖 daemon 的 0）。
+7. 【#22】连接故障细化：FileNotFoundError→daemon_not_running、
+   ConnectionRefusedError→daemon_refused、TimeoutError→daemon_timeout
+   （退出码统一 1）；--json 时输出 {"ok":false,"error":<code>,"message":...}，
+   无 --json 打带分类词的自然语言。
+8. 【#20】socket 安全本次不修（已知低危，PLAN-v1.2 §7）：/tmp/r3.sock 可预测、
+   同 uid 可注入；缓解 = R3_SOCK_PATH 指向用户专属目录。
+
+== v1.3 结论存档（PLAN-v1.3.md 决策 #23–#30；验收 P–V 组）==
+1. 【#23】路径解释权归调用方：CLI 在发送前把路径样目标（绝对路径或含分隔符的
+   相对路径）按调用方 cwd 展开为 realpath；纯裸名原样发送作 basename 别名。
+   daemon 侧不再 abspath（daemon cwd 不参与解析）；绝对路径精确未命中直接
+   报错不回退 basename；含分隔符的非绝对目标安全失败。
+2. 【#24】缓存键加 realpath 维：key = sha256(内容) + sha256(realpath)[:12]
+   + r2 版本；meta 命中追加 path 校验。同内容不同路径副本各用各的缓存。
+3. 【#25】e 配置按文件常驻：透传旁路记录 `e 名=值`，按名去重存入 Session；
+   磁盘模式落盘 <cache>/econf/<sid>.json，r2 每次新建/复活后重放；
+   cache-clean 连带清理 econf/。纯内存模式只记会话内存（close/重启即失）。
+4. 【#26】restart 先 status --json 取旧 cache.path，磁盘模式以 R3_CACHE_DIR
+   传给新 daemon，修复沙箱 .r3cache 锚点恢复；内存模式维持现状。
+5. 【#27】无当前会话不再懒建无文件 r2：pass 返回 code 5 no_active_session；
+   FILELESS_SID 常量保留兼容旧客户端。退出码表新增 5。
+6. 【#28】open 成功后发 iIj 追加一行文件信息速览（arch/bits/PIE/canary/NX/
+   stripped/静态动态链接/大小）；失败或超时省略不影响 open。
+7. 【#29】`r3 open <文件> --gitignore`：仅当缓存落在 .r3cache 档且向上找到
+   .git 时，向文件所在目录 .gitignore 幂等追加 .r3cache/。
+8. 【#30】AGENTS.md 重排压缩并同步 v1.3 行为；landlock stderr 噪声写入文档。
+
+== v2 结论存档（PLAN-v2.md 决策 #31–#38；验收 X 组，r2 6.1.9 / WSL）==
+1. 【#31/#37】入口 `r3 open <文件> --debug`：CLI 发 mode=debug，OpenMode.DEBUG
+   占位转正；版本 v2.0.0。同一文件 static/debug 互斥，模式不符杀旧 r2 以目标
+   模式重开并注明“已切换”。范围只做拉起式调试；attach/ESIL/远程/内核明确排除。
+2. 【#32】R2Process(debug=False, path=None)：debug=True 时 spawn
+   `r2 -q0 -d -e scr.color=0 -e scr.interactive=0 -e scr.pager=cat
+   -e dbg.profile=<daemon 管理的 profile> <path>`（不带 `-`）。
+   profile 内容固定 `stdio=/dev/null\n`，**不能带空格**（实测
+   `stdio = /dev/null` 不解析、目标 stdout 照漏）；tempfile.mkstemp 写入，
+   失败仅 log 并降级（目标输出可能混入 stdout）。P3：r2 只在拉起 debuggee
+   时读 profile，必须**收到就绪 NUL 之后**再删临时文件；Popen 后立刻删会
+   spawn 失败。Popen 加 start_new_session=True，debuggee 与 r2 同进程组。
+3. 【#32/#35】r2 6.1.9 不会自动清理 debuggee（无 PTRACE_O_EXITKILL）：r2 `q`
+   退出或被 SIGKILL 后 debuggee 仍存活。R2Process.kill() 用
+   `os.killpg(pid, SIGKILL)` 全组清理（兜底 proc.kill）；close/自愈/daemon
+   退出统一走该路径。若目标自行 setsid 改进程组可能漏杀（文档注明边界）。
+4. 【#33】debug 会话恢复禁 `o <path>`（会切走调试 io）且禁 `Po`（实测 static
+   工程 Po 进 debug 后 dr rip 归 0、断点跑飞）；只 verify_current_file +
+   pager + econf，分析由调用方用 `_debug_aaa(sess)` 决定。debug 会话不落
+   `Ps`/不写 meta（r2 也拒绝在 debugged bin 上 Ps），工程缓存只由 static
+   会话读写；现场 `aaa` 固定用 DEFAULT_CMD_TIMEOUT，不继承请求小 timeout。
+5. 【#34】status/sessions 文本加 [调试] 标签，结构化 JSON 加 "debug": true；
+   open 成功输出注明拉起式调试会话（目标已启动并停在 r2 初始断点）。
+6. 【#35】state.json 增存 debug 字段；_boot_restore/_resp_r2_dead/open 复用
+   分支按 sess.debug 重建 R2Process。debug 会话 `i~file` 仍输出真实路径、
+   `aaa` 分析真实文件且地址带运行时基址（PIE）；`iIj` 在 debug 下正常。
+7. 【#36】目标程序 stdio 经 profile 静音到 /dev/null：agent 看不到目标
+   printf，如需输出让目标自己写文件；attach 受内核 yama ptrace_scope=1
+   限制仅文档注明（错误文本原样透出）。超时语义不变（默认 900s；
+   `R3_CMD_TIMEOUT=30 r3 "dcu <addr>"` 做有界等待）。
+
+== v2.1 结论存档（PLAN-v2.1.md 决策 #39–#44；验收 Y 组，r2 6.1.9 / WSL）==
+1. 【#39 报错富化】debug 启动失败（就绪 NUL 超时/进程提前退出）时，异常必须
+   携带 r2 stderr 尾行。drain 线程除写 daemon.log 外追加带锁 ring buffer
+   （STDERR_BUF_CAP 字节），异常构造时快照、剥 CSI、折叠空白、取末
+   STDERR_TAIL_LEN 字符；空则标“(空)”，进程已退出时附退出码。
+2. 【#40 预检】R2Process debug 分支 Popen 前按序预检目标 isfile/R_OK/X_OK
+   （无执行权限文案直接说 chmod +x）；stdin_file 非 None 同时预检
+   isfile/R_OK。预检不替 agent 改权限；所有拉起路径统一受益。
+3. 【#41 回滚/自愈】open_file 模式切换失败回滚旧 debug/stdin_file、r2=None、
+   置 startup_failed/fail_reason；会话留在池里。后续普通命令命中 r2=None
+   时先按旧模式重建，成功即清标记并继续执行命令；open 重建成功同样清标记。
+   startup_failed 不持久化（boot 恢复按重建成功与否决定会话去留）。
+4. 【#42 stdin 注入】CLI `--stdin <文件>` 仅可与 `--debug` 组合；daemon 先
+   realpath + isfile/R_OK 校验。profile 有输入文件时写
+   `stdin=<绝对路径>` + `stdout=/dev/null` + `stderr=/dev/null` 三行
+   （实测可行且保持 NUL 分帧干净）；无输入文件维持 `stdio=/dev/null`。
+   state.json 增存 stdin_file，boot/自愈重建保持注入。
+5. 【#43 换输入 respawn】dbg.profile 只在拉起 debuggee 时读一次，stdin 是
+   拉起时快照（运行中追加无效）。同模式 debug 会话换 stdin_file（含重新
+   open 不带 --stdin 回默认静音）→ killpg 旧 r2/debuggee → 新 stdin_file
+   重新拉起 → 现场 aaa（debug 不落盘，分析状态按 sess.analyzed 决定）。
+6. 【#44 展示/版本】status/sessions 文本加 [输入文件: 路径] 与
+   [启动失败待重开]；structured JSON 加 stdin_file/startup_failed；
+   版本 v2.1.0。AGENTS/DESIGN/SKILL/acceptance 同步。
+
+== v1.3.1 修复存档（实测新问题 1–4；验收 W 组）==
+1. 【部署断档】新增 R3_VERSION=1.3.1，`r3 help` / `r3 status`（文本与 --json
+   的 daemon.r3_version）展示 r3 自身版本，部署新旧一眼可辨。
+2. 【--gitignore 落点】.gitignore 追加到缓存锚点目录 self.anchor_dir（也就是
+   .r3cache/ 的父目录），不再追加到本次打开文件所在目录；repo 检测也从锚点
+   目录向上查找。
+3. 【restart 回退原因】restart 传递旧缓存目录时同时设置
+   R3_CACHE_REASON_OVERRIDE，daemon 选中 R3_CACHE_DIR 档时显示
+   “restart 沿用上次生效缓存目录”，不再把锚点 .r3cache 误标成显式第一级。
+4. 【退出码语义】会话目标不存在/basename 歧义单列退出码 6
+   （error=session_not_found / session_ambiguous），不再占用“1=连接故障”；
+   close 无当前会话返回 5。
+"""
+
+import hashlib
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from collections import deque
+from enum import Enum
+
+# v1.1（决策 #12）+ v1.1.x 回退链：路径环境变量可配置。daemon 子进程继承拉起时
+# CLI 的环境变量，故 R3_CACHE_DIR/R3_SOCK_PATH/R3_NO_CACHE/XDG_CACHE_HOME 在
+# import 时读取即可自动生效。
+SOCK_PATH = os.environ.get("R3_SOCK_PATH", "/tmp/r3.sock")
+R3_CACHE_DIR = os.environ.get("R3_CACHE_DIR")  # 显式指定才非 None（回退链第一级）
+# restart 传递旧缓存目录时附带的原因标签；仅在 R3_CACHE_DIR 档被选中时使用，
+# 避免把“上次锚定的 .r3cache”误标成用户显式设置的第一级。
+R3_CACHE_REASON_OVERRIDE = os.environ.get("R3_CACHE_REASON_OVERRIDE")
+NO_CACHE = os.environ.get("R3_NO_CACHE") == "1"   # 纯内存模式：不落盘
+R3_VERSION = "2.1.0"             # r3 自身版本：help/status 展示，部署断档可一眼识别
+DEFAULT_MAX_OUT = 20000        # 透传输出默认截断长度（字符）
+DEFAULT_CMD_TIMEOUT = 900      # 单条命令看门狗（秒）——大文件 aaa 很慢，不能设短
+DEFAULT_BIGFILE_LIMIT = 52428800  # 50MB，超过则 aaa 降级为 aa
+LAZY_START_WAIT = 5.0          # 懒启动后轮询连接上限（秒）
+R2_BIN = "r2"
+# v2 #32：调试子进程 stdio 静音 profile。内容不能带空格——实测 "stdio = /dev/null"
+# 不被解析、目标 stdout 照漏；r2 只在拉起 debuggee 时读该文件，收到就绪 NUL 后
+# 即可删除（Popen 后立刻删会 spawn 失败）。
+DBG_PROFILE_CONTENT = "stdio=/dev/null\n"
+# v2.1 #39：stderr ring buffer 与异常富化。r2 的真实错误与鼠标禁用 CSI 序列同走
+# stderr，drain 线程除写 daemon.log 外同时保留最近一段原始字节，启动失败异常构造时
+# 清洗 CSI、折叠空白后取末 STDERR_TAIL_LEN 字符，把真实病因带给 agent。
+STDERR_BUF_CAP = 4096
+STDERR_TAIL_LEN = 500
+_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+MAX_SESSIONS = 16              # 会话数上限，超限 LRU 关最久未用的非活跃会话（v1.2 #15）
+FILELESS_SID = "default"       # v1.1 旧客户端硬编码的无文件 sid；仅兼容落回，不再懒建会话（#27）
+
+# 交互式命令黑名单：V 系列 / visual 模式会霸占终端、把管道挂死（PLAN §3）。
+INTERACTIVE_BLACKLIST = {
+    "V", "VV", "Vv", "Vi", "Vp", "Vk", "Vd", "Vb", "Vm", "Vs", "Vf", "Ve",
+    "v", "vv", "ve", "vp", "vk", "vvi",
+}
+
+TRUNCATE_BANNER = (
+    "\n⚠️ Output truncated at {n} chars. Narrow it down with r2 ~filter "
+    '(e.g. izz~password), or use: r3 --full "<cmd>"'
+)
+
+USAGE = """r3 — 常驻 radare2 传声筒（v{version}；daemon 抱着 r2 进程，分析状态跨调用存活）
+
+用法:
+  r3 "<任意 r2 命令>"          透传给常驻 r2。例: r3 "pdf @ main"
+  r3 --session <目标> "<命令>" 指定会话执行（目标=文件路径或已开会话 basename 别名）
+  r3 --json "<命令>"           声明 JSON 输出：保证不截断（不校验合法性）
+  r3 --full "<命令>"           不做 {max_out} 字符截断，看全量输出（与 --json 正交）
+  r3 open <文件路径> [--no-analyze] [--gitignore] [--debug [--stdin <输入文件>]]
+                                打开并分析（有缓存则秒开；同文件复用常驻会话）
+                                --debug: 拉起式动态调试（r2 -d），attach/ESIL 明确排除
+                                --stdin <输入文件>: 调试目标 stdin 从文件注入（仅可与 --debug 组合）
+  r3 open <文件> --no-analyze  只打开不分析（快速看字符串/节区）
+  r3 open <文件> --gitignore   缓存落 .r3cache 档时向缓存锚点目录幂等追加 .gitignore
+  r3 sessions                  列出所有会话；加 --json 输出结构化列表
+  r3 close [<目标>]            关闭当前/指定会话，释放 r2 进程（不删磁盘缓存）
+  r3 status [--json]           daemon 状态、会话列表、缓存模式/位置/回退原因
+  r3 restart                   杀 daemon → 重启 → 按缓存自动恢复上次打开的文件
+  r3 kill                      杀 daemon（下次任何 r3 调用会自动再拉起）
+  r3 cache-clean               删除全部工程缓存（含 meta）、econf/ + state.json
+  r3 help                      本帮助（v{version}）
+
+说明:
+  保留字: open/status/restart/kill/cache-clean/sessions/close/help，其余一律按 r2 命令透传。
+  多会话: 每个目标文件一个常驻 r2 会话，e 配置与分析状态按文件常驻；切走切回
+  不丢配置。--session 选择会话，未指定作用于最近一次 open/--session 的会话。
+  路径规则(v1.3): --session/open 的路径样目标按调用方 cwd 解析为绝对 realpath；
+  纯裸名（不含 /）才作为 basename 别名。路径样目标未命中直接报错，不回退裸名。
+  调试(v2.1): `r3 open <文件> --debug` 以拉起式 -d 启动会话（目标停在 r2 初始
+  断点）；db/dc/dr/wx/dbt 等调试命令照常透传。目标程序 stdout/stderr 被
+  dbg.profile 静音到 /dev/null（看不到目标 printf）；attach 受内核 yama
+  ptrace_scope=1 限制不可用；r3 close/超时/daemon 退出会 killpg 主动清理
+  debuggee。有界等待示例: `R3_CMD_TIMEOUT=30 r3 "dcu <addr>"`。
+  --stdin <输入文件> 只与 --debug 组合；文件在拉起时快照式读入（运行中追加无效），
+  换输入 = 重新 open（会重新拉起目标）。open --debug 失败会带预检提示（目标无
+  执行权限直接说 chmod +x）与 r2 stderr 尾行；模式切换失败自动回滚为原模式并标
+  [启动失败待重开]，下次普通命令或重新 open 会自动重建。
+  输出: 普通文本默认截断 {max_out} 字符（R3_MAX_OUT 可覆盖）；--json 声明 JSON
+  输出则保证不截断（请自行 json.loads 校验合法性）；--full 看全量。
+  退出码: 0 成功 / 1 连接或 daemon 故障 / 2 黑名单拒绝 / 3 超时 / 4 截断 /
+  5 无当前会话 / 6 会话目标不存在或有歧义（r3 sessions 查看已开会话）。
+  交互式命令（V 系列等）会被拒绝（退出码 2）。
+  路径可配置: R3_CACHE_DIR（显式指定）、R3_SOCK_PATH（默认 /tmp/r3.sock）；
+  缓存目录多级回退链: R3_CACHE_DIR → XDG ~/.cache/r3 → 打开文件目录/.r3cache
+  → 纯内存兜底，逐级写探针取第一个可写层级；R3_NO_CACHE=1 强制纯内存不落盘。
+  r3 status 显示最终生效路径、磁盘/内存模式与回退原因。
+  已知风险: socket 无鉴权（低危，同 uid 可注入命令）；缓解 = R3_SOCK_PATH 指向
+  用户专属目录（PLAN-v1.2 §7 决策 #20 暂不修）。
+  详细用法见 AGENTS.md。"""
+
+
+# ---------------------------------------------------------------- utilities
+
+_LOGGING_DIR = None    # daemon 解析出的生效缓存目录（CLI 侧保持 None）
+_cli_log_dir = None    # CLI 侧惰性解析结果（锚点未知的两级链）
+
+
+def xdg_cache_dir():
+    """XDG 缓存档：$XDG_CACHE_HOME/r3，未设置则 ~/.cache/r3（回退链第二级）。"""
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "r3")
+
+
+def resolve_cache_dir(anchor=None):
+    """缓存目录多级回退链（v1.1.x）：
+    ① R3_CACHE_DIR（显式指定）→ ② XDG ~/.cache/r3 → ③ 首次 open 文件所在
+    目录下的 .r3cache/（anchor 档）→ ④ 纯内存兜底。
+    每级先 makedirs、再 probe_writable（mkstemp+unlink 实写探针），选第一个
+    可写层级落盘。返回 (生效绝对路径或 None, 回退原因说明)。
+    """
+    chain = []
+    if R3_CACHE_DIR:
+        chain.append(("R3_CACHE_DIR", R3_CACHE_DIR))
+    chain.append(("XDG 缓存目录", xdg_cache_dir()))
+    if anchor:
+        chain.append(("文件所在目录", os.path.join(anchor, ".r3cache")))
+    tried = []
+    for label, d in chain:
+        try:
+            os.makedirs(d, exist_ok=True)
+            if probe_writable(d):
+                if not tried:
+                    # v1.3.1：restart 传递旧缓存目录时，标签说明来源是
+                    # “上次生效缓存目录”，不再误标成用户显式 R3_CACHE_DIR。
+                    if (label == "R3_CACHE_DIR"
+                            and R3_CACHE_REASON_OVERRIDE):
+                        reason = R3_CACHE_REASON_OVERRIDE
+                    else:
+                        reason = f"首选层级：{label}（{d}）"
+                else:
+                    reason = (f"回退：{'、'.join(tried)} 不可写 → "
+                              f"采用 {label}（{d}）")
+                return d, reason
+        except OSError:
+            pass
+        tried.append(f"{label}({d})")
+    return None, (f"回退：{'、'.join(tried)} 均不可写"
+                  " → 纯内存兜底（不落盘）")
+
+
+def log_dir():
+    """daemon 用生效缓存目录；CLI 侧（daemon 未解析前）用两级链结果。"""
+    global _cli_log_dir
+    if _LOGGING_DIR:
+        return _LOGGING_DIR
+    if _cli_log_dir is None:
+        _cli_log_dir, _ = resolve_cache_dir(None)
+    return _cli_log_dir
+
+
+def log(msg):
+    """daemon 日志（启动/命令/异常）。目录不可写/内存兜底时静默放弃。"""
+    try:
+        d = log_dir()
+        if not d:
+            return
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "daemon.log"), "a",
+                  encoding="utf-8", errors="replace") as f:
+            f.write(time.strftime("[%Y-%m-%d %H:%M:%S] ") + msg + "\n")
+    except OSError:
+        pass
+
+
+def env_int(name, default):
+    v = os.environ.get(name)
+    if v:
+        try:
+            return int(v)
+        except ValueError:
+            pass
+    return default
+
+
+def probe_writable(directory):
+    """真实写探针：在 directory 里 mkstemp + unlink 验证可写（返回 bool）。
+
+    实测陷阱（v1.1 后修）：os.makedirs(d, exist_ok=True) 对"已存在但只读"的
+    目录会直接成功返回、不抛异常——靠它判可写性会漏判，随后写 state.json
+    才 PermissionError。所以必须用真实写操作判可写。
+    """
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".r3-wt-", dir=directory)
+        os.close(fd)
+        os.unlink(tmp)
+        return True
+    except OSError:
+        return False
+
+
+def r2_version():
+    out = subprocess.run([R2_BIN, "-v"], capture_output=True, text=True,
+                         errors="replace").stdout
+    first = out.splitlines()[0].strip() if out else "r2-unknown"
+    return first  # 例: "radare2 6.1.9 +48 abi:127 @ linux-x86_64"
+
+
+def file_sha256(path):
+    """文件内容 SHA-256（缓存键与 meta 归属校验共用，v1.1 决策 #10）。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def version_slug(version):
+    return "".join(c if c.isalnum() or c in ".-_" else "-" for c in version)
+
+
+def meta_path_for(projdir):
+    """工程缓存旁的归属 meta 文件路径：<projdir>.meta.json（v1.1 决策 #10）。"""
+    return projdir + ".meta.json"
+
+
+def econf_path_for(cache_dir, sid):
+    """会话 e 配置落盘路径：<cache_dir>/econf/<sid>.json（v1.3 决策 #25）。"""
+    return os.path.join(cache_dir, "econf", f"{sid}.json")
+
+
+def e_cmd_name(command):
+    """从「e 名=值」样命令中取配置名；不是该形态返回 None。
+
+    只做旁路识别，不解析语义、不改写命令与输出（v1.3 决策 #25）。
+    """
+    if not command or not command.strip():
+        return None
+    parts = command.strip().split(None, 1)
+    if len(parts) != 2 or parts[0] != "e" or "=" not in parts[1]:
+        return None
+    return parts[1].split("=", 1)[0]
+
+
+def cache_key(path, version):
+    """缓存键 = SHA-256(文件内容) + SHA-256(realpath)[:12] + r2 版本号。
+
+    v1.3 决策 #24：加 realpath 维。同内容不同路径的副本不再共享工程缓存
+    （各用各的 key），meta 归属校验也追加 path 比对。v1.2 旧键自然不匹配
+    → 未命中重分析，永不误用。
+    """
+    rp = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+    return (file_sha256(path) + "-"
+            + hashlib.sha256(rp.encode("utf-8")).hexdigest()[:12] + "-"
+            + version_slug(version))
+
+
+def info_summary_line(sess):
+    """open 成功的文件信息速览（v1.3 决策 #28）。
+
+    发 `iIj` 解析 arch/bits/PIE/canary/NX/stripped/静态动态链接/大小。
+    任何失败/超时返回 None，调用方省略该行，不影响 open 成功与否。
+    """
+    if sess.r2 is None:
+        return None
+    try:
+        out, timed_out = sess.r2.cmd("iIj", 10)
+    except Exception:
+        return None
+    if timed_out or out is None:
+        return None
+    try:
+        d = json.loads(out.decode("utf-8", "replace"))
+        if not isinstance(d, dict):
+            return None
+    except (ValueError, UnicodeDecodeError):
+        return None
+    parts = [f"arch={d.get('arch') or '?'}"]
+    if d.get("bits"):
+        parts.append(f"{d.get('bits')}-bit")
+    if d.get("pic"):
+        parts.append("PIE")
+    if d.get("canary"):
+        parts.append("canary")
+    if d.get("nx"):
+        parts.append("NX")
+    parts.append("stripped" if d.get("stripped") else "未stripped")
+    parts.append("静态链接" if d.get("static") else "动态链接")
+    if d.get("binsz"):
+        parts.append(f"{d['binsz'] / 1024:.1f} KB")
+    return "文件信息: " + ", ".join(parts)
+
+
+def session_id(path):
+    """sid = sha256(realpath(文件)) 前 16 位十六进制（v1.2 §3.5）。
+
+    不用路径原样（含 /、空格、中文污染日志/协议），不用打开顺序——同一文件
+    永远映射同一 sid，会话按 realpath 自动汇聚（决策 #17）。
+    """
+    rp = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+    return hashlib.sha256(rp.encode("utf-8")).hexdigest()[:16]
+
+
+class OpenMode(Enum):
+    """open_file 的模式枚举：static 静态分析；debug 拉起式动态调试（v2 #31）。"""
+
+    STATIC = "static"
+    DEBUG = "debug"   # v2: r3 open --debug ./crackme，daemon 以 -d 模式启动 r2
+
+
+# ---------------------------------------------------------------- r2 子进程
+
+def _sanitize_stderr(data):
+    """清洗 r2 stderr 尾行（v2.1 #39）：剥 CSI/ANSI 序列、连续空白折叠为单空格。
+
+    鼠标禁用序列 `\x1b[?1000;1002;1006;1015l` 与真实错误同走 stderr，
+    不剥掉会污染异常消息；折叠空白让尾行更短、更可读。
+    """
+    text = data.decode("utf-8", "replace")
+    text = _CSI_RE.sub("", text)
+    return " ".join(text.split())
+
+
+class R2Process:
+    """抱着一个 r2 管道进程：写命令到 stdin，从 stdout 读 NUL 结尾的输出。
+
+    static 模式仍是 `r2 -q0 -`（"-" = 命令来自 stdin，不带文件常驻）。
+    v2 debug 模式为 `r2 -q0 -d -e ... -e dbg.profile=<tempfile> <path>`
+    （不带 "-"；实测 -d 带文件时命令仍从 stdin 读、就绪 NUL 照发）。
+
+    stderr 由后台线程持续排空：既写 daemon.log（见文件头协议结论第 5 条——
+    鼠标禁用 ANSI 序列只走 stderr，stdout 干净；排空也是防 r2 阻塞在满管道上），
+    也追加进带锁 ring buffer（v2.1 #39），启动失败时异常消息携带清洗后的尾行。
+
+    v2 #32/#35：
+    - Popen 加 start_new_session=True：r2 与 debuggee 同进程组，killpg 才能一次
+      全清（实测 r2 q 退出或被 SIGKILL 不会自动带走 debuggee）。
+    - dbg.profile 用 tempfile 写入内容（无空格）。收到就绪 NUL 后再删除临时文件
+      （P3：Popen 后立刻删会 spawn 失败）；写失败仅 log 并降级为不带 profile
+      启动（目标 stdio 继承 r2，输出可能混入）。
+
+    v2.1 #40/#42：
+    - debug 分支在 Popen 前预检目标 isfile/R_OK/X_OK；stdin_file 非 None 时
+      同时预检输入文件。预检不替 agent 改权限。
+    - --stdin 注入走 rarun2 `stdin=<绝对路径>` + stdout/stderr=/dev/null 三行
+      组合（实测可行且保持 NUL 分帧干净）；无输入文件时维持 stdio=/dev/null。
+    """
+
+    def __init__(self, debug=False, path=None, stdin_file=None):
+        self.debug = bool(debug)
+        self.path = path
+        self.stdin_file = stdin_file if self.debug else None
+        self._dbg_profile = None
+        if self.debug:
+            if not path:
+                raise ValueError("debug 模式必须提供 path（r2 -d 要拉起的目标文件）")
+            # #40 预检：Popen 之前统一拦截常见启动失败，报错直接说人话。
+            if not os.path.isfile(path):
+                raise RuntimeError(f"目标文件不存在: {path}")
+            if not os.access(path, os.R_OK):
+                raise RuntimeError(f"目标文件不可读: {path}")
+            if not os.access(path, os.X_OK):
+                st = os.stat(path)
+                raise RuntimeError(
+                    f"目标文件无执行权限（mode {oct(st.st_mode & 0o777)}）"
+                    f"——chmod +x {path} 后重试")
+            if self.stdin_file is not None and (
+                    not os.path.isfile(self.stdin_file)
+                    or not os.access(self.stdin_file, os.R_OK)):
+                raise RuntimeError(f"输入文件不存在或不可读: {self.stdin_file}")
+        self._stderr_buf = bytearray()
+        self._stderr_lock = threading.Lock()
+        self._stderr_eof = threading.Event()   # drain 线程读到 stderr EOF 后置位
+        args = [R2_BIN, "-q0"]
+        if self.debug:
+            args += ["-d"]
+        args += ["-e", "scr.color=0",      # 无色（验收 D1 要求输出无 ANSI）
+                 "-e", "scr.interactive=0",  # 无交互
+                 "-e", "scr.pager=cat"]   # 实测空字符串在管道模式下不生效（会导致 izz 等长输出挂 stdin），cat 让输出直接出来
+        if self.debug:
+            self._dbg_profile = self._write_dbg_profile(self.stdin_file)
+            if self._dbg_profile:
+                args += ["-e", f"dbg.profile={self._dbg_profile}"]
+            args += [path]                # -d 必须带文件（裸 r2 -q0 -d 报 Missing file）
+        else:
+            args += ["-"]                 # "-" = 命令来自 stdin，不带文件常驻
+        self.proc = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        self._leftover = b""
+        self._start_stderr_drain()
+        # 启动空 NUL = 就绪（协议结论第 2 条；debug 启动行为一致）
+        ready = self._read_until_nul(30)
+        if self._dbg_profile:
+            # P3：r2 只在拉起 debuggee 时读 profile；就绪 NUL 后删安全，立刻删会失败。
+            try:
+                os.unlink(self._dbg_profile)
+            except OSError as e:
+                log(f"delete dbg.profile failed: {e}")
+            self._dbg_profile = None
+        if ready is None:
+            # 进程退出时 stdout EOF 可能先于 stderr 排空线程看到 EOF；给 drain
+            # 一小段收尾时间再快照，避免真实 r2 错误行因线程调度竞态被漏掉。
+            self._stderr_eof.wait(0.2)
+            tail = self._stderr_tail()
+            status = self.proc.poll()
+            state = (f"进程已退出，退出码 {status}" if status is not None
+                     else "启动超时")
+            try:
+                self.kill()
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"r2 启动后未收到就绪 NUL（{state}）；r2 stderr 尾行: {tail}")
+
+    @staticmethod
+    def _dbg_profile_content(stdin_file):
+        """dbg.profile 内容（v2.1 #42）：有输入文件用 rarun2 stdin= 三行组合，
+        无输入文件维持 v2 的 stdio=/dev/null 静音三件套。指令不能带空格。
+        """
+        if stdin_file is not None:
+            return (f"stdin={stdin_file}\n"
+                    "stdout=/dev/null\n"
+                    "stderr=/dev/null\n")
+        return DBG_PROFILE_CONTENT
+
+    @staticmethod
+    def _write_dbg_profile(stdin_file):
+        """写 dbg.profile 临时文件；失败返回 None（调用方降级，日志已记）。"""
+        try:
+            fd, tmp = tempfile.mkstemp(prefix="r3-dbg-profile-")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(R2Process._dbg_profile_content(stdin_file))
+            return tmp
+        except OSError as e:
+            log(f"write dbg.profile failed ({e}); debuggee stdio 将继承 r2，"
+                "目标输出可能混入 stdout")
+            return None
+
+    def _start_stderr_drain(self):
+        def drain():
+            try:
+                while True:
+                    chunk = self.proc.stderr.read(1 << 16)
+                    if not chunk:
+                        break
+                    log("r2-stderr: " + chunk.decode("utf-8", "replace").rstrip())
+                    with self._stderr_lock:
+                        self._stderr_buf.extend(chunk)
+                        if len(self._stderr_buf) > STDERR_BUF_CAP:
+                            del self._stderr_buf[:-STDERR_BUF_CAP]
+            except Exception as e:  # pragma: no cover
+                log(f"stderr drainer exit: {e}")
+            finally:
+                self._stderr_eof.set()
+        threading.Thread(target=drain, daemon=True).start()
+
+    def _stderr_tail(self):
+        """异常构造时快照 ring buffer，清洗后取末 STDERR_TAIL_LEN 字符。"""
+        with self._stderr_lock:
+            raw = bytes(self._stderr_buf)
+        tail = _sanitize_stderr(raw)[-STDERR_TAIL_LEN:] or "(空)"
+        return tail
+
+    def _read_until_nul(self, timeout):
+        """读到 NUL 为止，返回 NUL 前的字节串；超时/进程死返回 None。"""
+        buf = self._leftover
+        self._leftover = b""
+        deadline = time.time() + timeout
+        fd = self.proc.stdout.fileno()
+        while True:
+            if b"\x00" in buf:
+                out, _, rest = buf.partition(b"\x00")
+                self._leftover = rest
+                return out
+            if time.time() >= deadline:
+                return None
+            r, _, _ = select.select([fd], [], [], 0.2)
+            if r:
+                chunk = os.read(fd, 1 << 16)
+                if not chunk:  # r2 死了
+                    return None
+                buf += chunk
+
+    def cmd(self, command, timeout):
+        """执行一条 r2 命令。返回 (输出字节串, 是否超时)。"""
+        try:
+            self.proc.stdin.write((command + "\n").encode())
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return None, False  # r2 已死
+        out = self._read_until_nul(timeout)
+        if out is None:
+            # 区分超时 vs 进程死亡
+            if self.proc.poll() is not None:
+                return None, False
+            return None, True
+        return out, False
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def kill(self):
+        """全组 SIGKILL：r2 + debuggee 一次清理（v2 #32/#35）。
+
+        实测 r2 6.1.9 的 q/裸 SIGKILL 不会自动带走 debuggee
+        （无 PTRACE_O_EXITKILL）；start_new_session 使 r2 成为组长、
+        debuggee 与其同进程组，因此 killpg 可一次全杀。组已空等异常时
+        兜底 proc.kill（普通 SIGKILL 到组长）。
+        """
+        try:
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+        try:
+            self.proc.wait(timeout=5)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------- 会话（v1.2）
+
+class Session:
+    """文件级会话（v1.2 决策 #15）：一个目标文件一个 r2 进程 + 该文件的分析状态。
+
+    v1.3 决策 #25：e 配置按文件常驻——透传旁路把 `e 名=值` 记录到 e_cmds
+    （按名去重，后设覆盖），r2 每次新建/复活后重放；磁盘模式同步落盘
+    <cache_dir>/econf/<sid>.json。cur_file 为 None 表示无文件会话。
+    """
+
+    def __init__(self, sid):
+        self.sid = sid
+        self.r2 = None
+        self.cur_file = None
+        self.debug = False              # v2 #33/#34：该会话是否为拉起式调试态
+        self.stdin_file = None          # v2.1 #42：debug 目标 stdin 注入文件（realpath）
+        self.startup_failed = False     # v2.1 #41：上次拉起失败，待下次命令/open 自愈
+        self.fail_reason = None         # 上次拉起失败的富化原因（status 诊断用）
+        self.analyzed = False
+        self.cache_hit = False           # 最近一次 open 是否命中缓存
+        self.bigfile_downgraded = False
+        self.e_cmds = {}                 # v1.3 #25: name -> "e name=value"（插入序）
+        self.recent = deque(maxlen=10)   # 最近命令（status 展示用）
+        self.last_used = time.time()     # LRU 依据（决策 #15 资源控制）
+
+
+# ---------------------------------------------------------------- daemon
+
+class Daemon:
+    """单线程 accept 循环，串行处理命令——两个 agent 同时敲 r3 只是排队（PLAN §3）。
+
+    v1.2：从「单一 r2+单一文件」升级为「文件级会话池」（决策 #15/#17）：
+    self.sessions[sid] = Session，self.active_sid 指向最近一次 open 或
+    带 --session 的调用选中的会话；无 --session 的调用作用于 active_sid。
+    """
+
+    def __init__(self):
+        # 缓存目录多级回退链（v1.1.x）：R3_CACHE_DIR → XDG → 首次 open 文件目录
+        # 的 .r3cache/ → 纯内存兜底；逐级 probe_writable 取第一个可写层级。
+        # anchor_dir = 首次 open 文件的 dirname(realpath)，锚定 .r3cache 档
+        #（切换文件不换锚；daemon 重启后随首次 open 重新锚定）。
+        self.memory_mode = NO_CACHE
+        self.anchor_dir = None      # 首次 open 文件的 dirname(realpath)
+        self.cache_dir = None       # 最终生效缓存目录（绝对路径；None=纯内存兜底）
+        self.cache_reason = ""      # 回退原因（status 展示）
+        if self.memory_mode:
+            self.cache_reason = "R3_NO_CACHE=1 纯内存模式（不落盘）"
+        else:
+            self._resolve_cache()   # 启动时锚点未知 → 两级链；首次 open 后重解
+        self.version = r2_version()
+        self.started_at = time.time()
+        # ---- v1.2 会话池（决策 #15）----
+        self.sessions = {}          # dict[sid, Session]
+        self.active_sid = None      # 最近一次 open/--session 选中的会话
+
+    # ---- 缓存目录解析（回退链）----
+
+    def _resolve_cache(self):
+        """按回退链重解生效缓存目录。daemon 启动（锚点未知）与首次 open
+        锚定后各跑一次；之后锚点不再变化，目录保持稳定。"""
+        global _LOGGING_DIR
+        self.cache_dir, self.cache_reason = resolve_cache_dir(self.anchor_dir)
+        self.memory_mode = self.cache_dir is None
+        _LOGGING_DIR = self.cache_dir   # daemon 日志跟随生效目录
+        log(f"cache dir resolved: {self.cache_dir or '(memory fallback)'} "
+            f"— {self.cache_reason}")
+
+    def _degrade_memory(self, why):
+        """写盘失败兜底：降级纯内存，绝不让 PermissionError 冒泡成内部错误。"""
+        global _LOGGING_DIR
+        self.memory_mode = True
+        self.cache_dir = None
+        self.cache_reason = f"回退：写盘失败（{why}）→ 纯内存兜底（不落盘）"
+        _LOGGING_DIR = None
+        log(self.cache_reason)
+
+    def _projects_dir(self):
+        return os.path.join(self.cache_dir, "projects") if self.cache_dir else None
+
+    def _state_path(self):
+        return os.path.join(self.cache_dir, "state.json") if self.cache_dir else None
+
+    # ---- 会话池（v1.2 #15）----
+
+    def _evict_lru(self):
+        """会话数超 MAX_SESSIONS 时关最久未用的非活跃会话（决策 #15 资源控制）。"""
+        while len(self.sessions) > MAX_SESSIONS:
+            victim = None
+            for s in self.sessions.values():
+                if s.sid == self.active_sid:
+                    continue
+                if victim is None or s.last_used < victim.last_used:
+                    victim = s
+            if victim is None:   # 理论上不可达（至少有一个非活跃会话）
+                break
+            log(f"LRU evict session {victim.sid} ({victim.cur_file or 'fileless'})")
+            if victim.r2 is not None:
+                try:
+                    victim.r2.kill()
+                except Exception:
+                    pass
+            del self.sessions[victim.sid]
+
+    def _resolve_sid(self, target):
+        """--session 目标解析（v1.3 决策 #23 改写）：
+        ① sid 直接命中 → ② 绝对路径只做精确 realpath 匹配，未中直接报错、
+        不回退 basename → ③ 含分隔符但非绝对的目标安全失败（旧客户端）→
+        ④ 纯裸名才做 basename 模糊匹配，歧义报错列候选。
+        daemon cwd 不参与任何目标解析。返回 (sid 或 None, 错误或 None)。
+        """
+        if target in self.sessions:
+            return target, None
+        if os.path.isabs(target):
+            rp = os.path.realpath(os.path.expanduser(target))
+            hits = [s for s in self.sessions.values()
+                    if s.cur_file and s.cur_file == rp]
+            if len(hits) == 1:
+                return hits[0].sid, None
+            return None, f"会话 '{target}' 不存在（r3 sessions 查看已开会话）"
+        if "/" in target:
+            return None, (f"会话目标 '{target}' 请使用绝对路径"
+                          "（v1.3 起相对路径由调用方解析）")
+        base = target
+        hits = [s for s in self.sessions.values()
+                if s.cur_file and os.path.basename(s.cur_file) == base]
+        if len(hits) == 1:
+            return hits[0].sid, None
+        if len(hits) > 1:
+            return None, (f"会话目标 '{target}' 有歧义（basename 冲突），"
+                          "候选: " + ", ".join(s.cur_file for s in hits))
+        return None, f"会话 '{target}' 不存在（r3 sessions 查看已开会话）"
+
+    def _file_sessions(self):
+        return [s for s in self.sessions.values() if s.cur_file]
+
+    # ---- r2 生命周期（作用对象 = 某个 Session，v1.2）----
+
+    def _boot_restore(self):
+        """daemon 启动时按 state.json + 缓存自动恢复上次打开的文件（v1.1 §4.1
+        语义，落到会话池）：重建 last_file 的常驻会话（缓存命中则秒开）。
+
+        其余旧会话的 r2 已随 daemon 退出消失，不重建——下次 open 按需新建，
+        磁盘缓存仍在（open 时命中）。v2 #35：按 state.debug 以 static/debug
+        对应模式重建；debug 会话恢复不 Po，sess.analyzed 从 state 带回，
+        调用方据此决定是否 _debug_aaa。
+        """
+        if self.memory_mode:
+            return
+        st = self._load_state()
+        if not st or not st.get("last_file") or not os.path.exists(st["last_file"]):
+            return
+        path = os.path.realpath(st["last_file"])
+        sid = session_id(path)
+        sess = Session(sid)
+        sess.cur_file = path
+        sess.debug = bool(st.get("debug"))       # v2 #35：缺失默认 False（兼容旧 state）
+        sess.stdin_file = st.get("stdin_file")   # v2.1 #42：boot 恢复保持输入注入
+        sess.analyzed = bool(st.get("analyzed"))
+        try:
+            sess.r2 = R2Process(debug=sess.debug,
+                                path=path if sess.debug else None,
+                                stdin_file=sess.stdin_file if sess.debug else None)
+        except (RuntimeError, ValueError) as e:
+            log(f"boot restore: r2 spawn failed: {e}")
+            return
+        self.sessions[sid] = sess
+        self.active_sid = sid
+        try:
+            self._restore_session_file(sess, st=st)
+            if sess.debug and sess.analyzed:
+                cmd, err = self._debug_aaa(sess)
+                if err:
+                    log(f"boot restore: debug aaa failed ({cmd}: {err})")
+        except Exception as e:
+            log(f"boot restore failed: {e}")
+
+    def _restore_session_file(self, sess, st=None):
+        """为会话重建 r2 现场（boot 恢复 / 看门狗杀 r2 后自愈 / 复用前复活共用）。
+
+        static：优先 Po 工程缓存（meta 归属校验，v1.1 决策 #10 + v1.3 #24
+        path 维），失败/缺失则仅重新打开不分析。
+        debug（v2 #33）：**不 `o path`**（会切走调试 io、破坏 -d 态），
+        也**不 `Po`**（实测 static 工程 Po 进 debug 后 dr rip 归 0、断点
+        跑飞）；只做 verify_current_file + pager 重设 + econf 重放。
+        是否分析由调用方用 _debug_aaa(sess) 决定（open 按 analyze 参数；
+        自愈/复用/boot 按 sess.analyzed）。
+        st = 启动时读到的 state.json（带 key，省一次 sha 计算；v1.2 旧
+        格式 key 不匹配时重算兜底）。
+        """
+        path = sess.cur_file
+        if not path or not os.path.isfile(path):
+            return
+        if sess.debug:
+            # -d 启动时目标已打开并停在初始断点；这里绝不 o/Po，只恢复现场。
+            out, timed_out = sess.r2.cmd("e scr.pager=cat", 10)
+            if timed_out or not sess.r2.alive():
+                raise RuntimeError("调试会话恢复 pager 超时")
+            if not self.verify_current_file(sess, path):
+                raise RuntimeError(f"调试会话当前文件校验失败: {path}")
+            self._apply_econf(sess)
+            log(f"session {sess.sid} debug session restored without o/Po: {path}")
+            return
+        key = (st or {}).get("key")
+        # v1.3 #24：新 key 第二段是 12 位 path 哈希；旧 state 的 v1.2 key
+        # 第二段以 "radare2..." 开头，识别为旧格式后重算，自然作废旧工程。
+        parts = key.split("-") if key else []
+        if (not key or len(parts) < 2 or len(parts[1]) != 12
+                or any(c not in "0123456789abcdef" for c in parts[1])):
+            key = cache_key(path, self.version)
+        pd = self._projects_dir()
+        projdir = os.path.join(pd, key) if pd else None
+        meta = None
+        if projdir and not self.memory_mode:
+            meta = self._load_meta(meta_path_for(projdir))
+        restored = False
+        if (not self.memory_mode and projdir and os.path.isfile(projdir)
+                and meta and meta.get("sha256") == file_sha256(path)
+                and meta.get("path") == path):
+            out, timed_out = sess.r2.cmd(f"Po {projdir}", 120)
+            if timed_out or not sess.r2.alive():
+                raise RuntimeError("恢复工程超时")
+            sess.r2.cmd("e scr.pager=cat", 10)
+            if self.verify_current_file(sess, path):
+                sess.analyzed, sess.cache_hit = True, True
+                restored = True
+                log(f"session {sess.sid} restored from project cache: {path}")
+            else:
+                log(f"session {sess.sid} restore verify failed for {path}, "
+                    "fallback to plain open")
+        if not restored:
+            # 无缓存 / meta 校验失败 / verify 失败：仅重新打开，不分析
+            out, timed_out = sess.r2.cmd(f"o {path}", 60)
+            if timed_out or not sess.r2.alive():
+                raise RuntimeError("重新打开文件超时")
+            sess.r2.cmd("e scr.pager=cat", 10)
+            sess.analyzed, sess.cache_hit = False, False
+            log(f"session {sess.sid} reopened without analysis "
+                f"(cache invalid or absent): {path}")
+        # v1.3 #25：文件打开 + pager 重设后重放 e 配置（boot/自愈/复用前复活）。
+        self._apply_econf(sess)
+
+    def _debug_aaa(self, sess, bigfile_limit=None):
+        """debug 会话现场分析（v2 #33）：aaa/大文件降级 aa，不落 Ps/meta。
+
+        超时固定 DEFAULT_CMD_TIMEOUT（不继承本次请求的小 timeout，避免
+        `R3_CMD_TIMEOUT=1 r3 "dc"` 自愈后现场 aaa 被 1 秒打断）。返回
+        (analysis_cmd, err)，err 为 None 表示成功；timeout/dead 表示
+        分析命令超时或 r2 死亡（是否调用 _resp_r2_dead 由调用方决定）。
+        """
+        if sess.r2 is None or not sess.r2.alive():
+            return "", "dead"
+        path = sess.cur_file
+        if not path or not os.path.isfile(path):
+            return "", "dead"
+        size = os.path.getsize(path)
+        limit = bigfile_limit or env_int("R3_BIGFILE_LIMIT",
+                                         DEFAULT_BIGFILE_LIMIT)
+        analysis_cmd = "aaa"
+        if size > limit:
+            analysis_cmd = "aa"  # 大文件降级为轻量分析
+        sess.bigfile_downgraded = (analysis_cmd == "aa")
+        out, timed_out = sess.r2.cmd(analysis_cmd, DEFAULT_CMD_TIMEOUT)
+        if timed_out:
+            sess.analyzed = False
+            return analysis_cmd, "timeout"
+        if out is None or not sess.r2.alive():
+            sess.analyzed = False
+            return analysis_cmd, "dead"
+        # debug 会话分析不 Ps、不写 meta；sess.analyzed 只反映现场分析状态。
+        sess.analyzed = True
+        sess.cache_hit = False
+        log(f"session {sess.sid} debug aaa in-memory: {path} ({analysis_cmd})")
+        return analysis_cmd, None
+
+    def _load_state(self):
+        sp = self._state_path()
+        if not sp:
+            return None
+        try:
+            with open(sp, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    def _save_state_with_key(self, sess, path, key):
+        if self.memory_mode:
+            return  # 纯内存模式：不写 state.json（决策 #12）
+        sp = self._state_path()
+        try:
+            data = {"last_file": path, "key": key, "analyzed": sess.analyzed,
+                    "debug": bool(sess.debug),      # v2 #35：boot 恢复按此重建模式
+                    # v2.1 #42：boot 恢复按此重建 stdin 注入；startup_failed 不持久化
+                    #（daemon 重启后的恢复按“重建成功与否”自然决定会话去留）。
+                    "stdin_file": sess.stdin_file,
+                    "ts": time.time()}
+            tmp = sp + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, sp)
+        except OSError:
+            # 写盘失败 → 静默降级内存模式，不打断 open
+            self._degrade_memory(f"state.json 写盘失败（{sp}）")
+
+    # ---- e 配置按文件常驻（v1.3 #25）----
+
+    def _save_econf(self, sess):
+        """把会话 e_cmds 原子写到 <cache_dir>/econf/<sid>.json。
+
+        磁盘模式才落盘；内存模式 no-op（close/daemon 重启即失，文档注明）。
+        写失败仅 log，不打断命令。
+        """
+        if self.memory_mode or not self.cache_dir or not sess.cur_file:
+            return
+        path = econf_path_for(self.cache_dir, sess.sid)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            data = {"file": sess.cur_file,
+                    "cmds": list(sess.e_cmds.values())}
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except OSError as e:
+            log(f"save econf failed for {sess.sid}: {e}")
+
+    def _apply_econf(self, sess):
+        """r2 新建/复活后重放该文件的 e 配置。
+
+        磁盘模式：读 econf 文件（缺失/损坏/file 不匹配 → 跳过），与内存中
+        e_cmds 合并（内存覆盖磁盘，保证写入失败时新值仍优先）后重放；
+        内存模式：仅用会话内存 e_cmds。重放失败仅 log，不致命。
+        """
+        path = sess.cur_file
+        if not path or sess.r2 is None:
+            return
+        cmds_by_name = {}
+        if not self.memory_mode and self.cache_dir:
+            try:
+                with open(econf_path_for(self.cache_dir, sess.sid),
+                          "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                if (isinstance(d, dict) and d.get("file") == path
+                        and isinstance(d.get("cmds"), list)):
+                    for cmd in d["cmds"]:
+                        name = e_cmd_name(cmd)
+                        if name:
+                            cmds_by_name[name] = cmd
+            except (OSError, ValueError):
+                pass
+        # 内存中的记录更新（同一 name 后设覆盖），并与磁盘记录合并。
+        cmds_by_name.update(sess.e_cmds)
+        sess.e_cmds = cmds_by_name
+        for cmd in cmds_by_name.values():
+            out, timed_out = sess.r2.cmd(cmd, 10)
+            if timed_out or out is None:
+                log(f"replay econf command failed for {sess.sid}: {cmd}")
+
+    # ---- meta 与校验（v1.1 决策 #10）----
+
+    @staticmethod
+    def _load_meta(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    def _write_meta(self, meta_path, key, path, sha, analysis):
+        """Ps 成功之后才写 meta（Ps 失败则无 meta → 下次视为未命中重分析，安全方向）。"""
+        try:
+            data = {"key": key, "sha256": sha, "path": path,
+                    "version": self.version, "analysis": analysis,
+                    "ts": time.time()}
+            tmp = meta_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, meta_path)
+        except OSError:
+            log(f"write meta failed: {meta_path}")
+
+    def _delete_dirty_cache(self, projdir):
+        """删除脏缓存三件套：工程文件本体、<projdir>.d 目录、meta（§3.4/§4.1）。
+
+        返回实际删除的条目数（只统计真实删掉的）。
+        """
+        n = 0
+        for p in (projdir, projdir + ".d", projdir + ".meta.json"):
+            try:
+                if os.path.isdir(p) and not os.path.islink(p):
+                    shutil.rmtree(p)
+                    n += 1
+                elif os.path.exists(p):
+                    os.unlink(p)
+                    n += 1
+            except OSError:
+                pass
+        return n
+
+    def verify_current_file(self, sess, path):
+        """发 `i~file` 校验该会话 r2 当前 bin 就是目标文件（PLAN-v1.1 §4.1）。
+
+        实测格式：`file     /path`（首 token 为 "file"，路径取 split()[1]）。
+        没有 file 行（未打开文件）视为校验失败。r2 原样回显传入路径，而本
+        daemon 的 o 一律传 realpath，故与 realpath 比较是可靠的。
+        """
+        if sess.r2 is None:
+            return False
+        out, timed_out = sess.r2.cmd("i~file", 30)
+        if timed_out or out is None:
+            return False
+        for line in out.decode("utf-8", "replace").splitlines():
+            parts = line.split()
+            if parts and parts[0] == "file" and len(parts) >= 2:
+                return parts[1] == path
+        return False
+
+    # ---- open（PLAN §5 + PLAN-v1.1 §4.1 + PLAN-v1.2 §4.1）----
+
+    def _maybe_gitignore(self, path, notes):
+        """`r3 open <文件> --gitignore` 动作（v1.3 决策 #29；v1.3.1 修正落点）。
+
+        .r3cache/ 的真实落点是「缓存锚点目录」（首次 open 文件的 dirname），
+        而不是本次被打开文件所在目录。因此 .gitignore 必须追加到锚点目录；
+        从锚点目录向上找 .git（目录或 worktree 文件均可）。
+        """
+        if not (self.cache_dir and self.anchor_dir
+                and os.path.realpath(self.cache_dir)
+                == os.path.realpath(os.path.join(self.anchor_dir, ".r3cache"))):
+            notes.append("--gitignore：缓存未落在 .r3cache 档，无操作")
+            return
+        d = self.anchor_dir
+        repo = None
+        while True:                 # 向上逐级找 .git（目录或 worktree 文件均可）
+            if os.path.exists(os.path.join(d, ".git")):
+                repo = d
+                break
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        if repo is None:
+            notes.append("--gitignore：未检测到 git 仓库（向上未找到 .git），未追加")
+            return
+        gi = os.path.join(self.anchor_dir, ".gitignore")
+        try:
+            content = None
+            if os.path.exists(gi):
+                with open(gi, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if any("r3cache" in ln for ln in content.splitlines()):
+                    notes.append(f"--gitignore：{gi} 已含 r3cache 条目，未重复追加")
+                    return
+            prefix = ""
+            if content is not None and content and not content.endswith("\n"):
+                prefix = "\n"     # 避免与既有末行粘连
+            with open(gi, "a", encoding="utf-8") as f:
+                f.write(prefix + ".r3cache/\n")
+            notes.append(f"--gitignore：已追加 .r3cache/ 到 {gi}")
+        except (OSError, UnicodeDecodeError) as e:
+            notes.append(f"--gitignore：追加失败（{e}），请手动添加")
+
+    # ---- open（PLAN §5 + PLAN-v1.1 §4.1 + PLAN-v1.2 §4.1 + PLAN-v1.3 §4.2–4.7）----
+
+    def open_file(self, path, mode=OpenMode.STATIC, analyze=True,
+                  bigfile_limit=None, gitignore=False, stdin_file=None):
+        """打开文件并建立/复用会话（PLAN v1 + v1.1 + v1.2 + v1.3 + v2 + v2.1）。
+
+        v1.2（决策 #15/#17）：按 realpath 汇聚会话。同文件同模式会话已存在 →
+        复用（不杀、不重开 → e 配置与分析状态保留）；全新文件才新建会话。
+        v1.3（决策 #24/#25/#28/#29）：缓存键含 realpath 维；meta 命中加 path
+        校验；成功路径重放 econf 并输出一行 iIj 文件信息；--gitignore 可选动作。
+        v2（决策 #31/#33）：同一文件 static/debug 互斥，模式不符杀旧 r2 以目标
+        模式重开并注明"已切换"。debug 流程不 Po/不 Ps/不写 meta，分析只在会话
+        内存（--no-analyze 跳过）；工程缓存只由 static 会话读写。
+        v2.1（决策 #40–#43）：debug 分支先校验 stdin_file（不白拉 r2）；模式
+        切换失败回滚旧模式并标 startup_failed；同模式换输入文件会重新拉起。
+        """
+        if mode not in (OpenMode.STATIC, OpenMode.DEBUG):
+            return {"ok": False, "code": 1, "out": f"未知打开模式: {mode}"}
+        want_debug = (mode == OpenMode.DEBUG)
+        path = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+        t0 = time.time()
+        if not os.path.exists(path):
+            return {"ok": False, "code": 1, "out": f"文件不存在: {path}"}
+        if not os.path.isfile(path):
+            return {"ok": False, "code": 1, "out": f"不是普通文件: {path}"}
+
+        # v2.1 #42：仅 debug 生效。CLI 已按调用方 cwd 解析，这里再 realpath 一次
+        # 兜底旧客户端/直接协议调用；校验放在杀旧 r2 / R2Process 构造之前。
+        if want_debug and stdin_file is not None:
+            stdin_file = os.path.realpath(
+                os.path.abspath(os.path.expanduser(stdin_file)))
+            if not os.path.isfile(stdin_file) or not os.access(stdin_file, os.R_OK):
+                return {"ok": False, "code": 1,
+                        "out": f"输入文件不存在或不可读: {stdin_file}"}
+
+        # 回退链锚定：工作目录档（.r3cache）锚在首次 open 文件的
+        # dirname(realpath)。首次 open 前锚点未知，解析的是两级链；
+        # 锚定后重解一次，可能切到文件目录档（切换文件不换锚）。
+        if self.anchor_dir is None:
+            self.anchor_dir = os.path.dirname(path)
+            if not NO_CACHE:
+                self._resolve_cache()
+
+        sid = session_id(path)
+        sess = self.sessions.get(sid)
+        notes = []
+
+        def success_out(head_lines):
+            """成功返回的统一出口：追加 --gitignore 动作与文件信息速览行。"""
+            if gitignore:
+                self._maybe_gitignore(path, notes)
+            info = info_summary_line(sess)
+            lines = list(head_lines) + notes
+            # v2.1 #42/#44：debug 且带输入文件时，成功输出明确注明。
+            if sess.debug and sess.stdin_file is not None:
+                lines.append(f"输入文件: {sess.stdin_file}")
+            if info:
+                lines.append(info)
+            return {"ok": True, "code": 0, "out": "\n".join(lines)}
+
+        # 生效档是文件目录 .r3cache/ 时提示加入 .gitignore（r2 工程内含 .git）。
+        # debug 会话不落工程缓存，此提示只在 static 流程展示。
+        if (not want_debug and self.cache_dir and self.anchor_dir
+                and self.cache_dir == os.path.join(self.anchor_dir, ".r3cache")):
+            notes.append(
+                "缓存落在文件所在目录的 .r3cache/（r2 工程内含 .git）；"
+                "若该目录在 git 仓库内，请把 .r3cache/ 加入 .gitignore")
+
+        mode_switched = False
+        respawned = False
+        if sess is None:
+            sess = Session(sid)
+            sess.debug = want_debug
+            sess.stdin_file = stdin_file if want_debug else None
+            sess.cur_file = path
+            self.sessions[sid] = sess
+            self._evict_lru()
+            try:
+                sess.r2 = R2Process(debug=want_debug,
+                                    path=path if want_debug else None,
+                                    stdin_file=stdin_file if want_debug else None)
+            except (RuntimeError, ValueError) as e:
+                # 新建失败维持删会话回滚（#41）；富化异常由 R2Process 给出。
+                del self.sessions[sid]
+                return {"ok": False, "code": 1, "out": f"r2 启动失败: {e}"}
+            notes.append(f"新建会话 {sid}")
+        elif sess.debug != want_debug:
+            # v2 #31：同一文件 static/debug 互斥——杀旧 r2 以目标模式重开，
+            # 复用 sid/econf；工程缓存只由 static 会话读写。
+            # v2.1 #41：模式切换失败必须把账本回滚为旧模式 + 待重开标记。
+            mode_switched = True
+            old_debug = sess.debug
+            old_stdin = sess.stdin_file
+            if sess.r2 is not None:
+                try:
+                    sess.r2.kill()
+                except Exception:
+                    pass
+            sess.debug = want_debug
+            sess.stdin_file = stdin_file if want_debug else None
+            sess.cur_file = path
+            sess.r2 = None
+            try:
+                sess.r2 = R2Process(debug=want_debug,
+                                    path=path if want_debug else None,
+                                    stdin_file=stdin_file if want_debug else None)
+            except (RuntimeError, ValueError) as e:
+                sess.debug = old_debug
+                sess.stdin_file = old_stdin
+                sess.r2 = None
+                sess.startup_failed = True
+                sess.fail_reason = str(e)
+                return {"ok": False, "code": 1,
+                        "out": f"r2 模式切换启动失败: {e}\n"
+                               "会话已回滚为原模式；下次命令或重新 open 会自动重建"
+                               "（status 显示[启动失败待重开]）"}
+            self._mark_rebuilt(sess)
+            try:
+                self._restore_session_file(sess)
+            except Exception as e:
+                log(f"session {sid} restore failed after mode switch: {e}")
+            notes.append("会话已切换为"
+                         + ("调试模式（static→debug，目标已由 -d 拉起）"
+                            if want_debug else "静态模式（debug→static）"))
+        else:
+            # v2.1 #43：同模式 debug 会话换 stdin_file = 重新拉起（dbg.profile
+            # 只在拉起时读一次，stdin 是快照语义）。不带 --stdin 重开 = None，
+            # 同样 respawn 回默认静音三件套。
+            respawn = (sess.r2 is not None and sess.r2.alive() and want_debug
+                       and sess.stdin_file != stdin_file)
+            if respawn:
+                try:
+                    sess.r2.kill()
+                except Exception:
+                    pass
+                sess.r2 = None
+                respawned = True
+            if sess.r2 is None or not sess.r2.alive():
+                if sess.r2 is not None:
+                    try:
+                        sess.r2.kill()
+                    except Exception:
+                        pass
+                sess.cur_file = path
+                try:
+                    sess.r2 = R2Process(debug=want_debug,
+                                        path=path if want_debug else None,
+                                        stdin_file=stdin_file if want_debug else None)
+                except (RuntimeError, ValueError) as e:
+                    sess.r2 = None
+                    sess.startup_failed = True
+                    sess.fail_reason = str(e)
+                    return {"ok": False, "code": 1,
+                            "out": f"r2 重启失败: {e}\n"
+                                   "会话已标记为[启动失败待重开]；"
+                                   "下次命令或重新 open 会自动重建"}
+                # 重建成功才更新账本中的输入文件；失败时保留上次真实生效值。
+                if want_debug:
+                    sess.stdin_file = stdin_file
+                self._mark_rebuilt(sess)
+                try:
+                    self._restore_session_file(sess)
+                except Exception as e:
+                    log(f"session {sid} restore failed on reuse: {e}")
+                if respawned:
+                    if stdin_file is not None:
+                        notes.append("已按新输入文件重新拉起目标"
+                                     "（输入为拉起时快照）")
+                    else:
+                        notes.append("已重新拉起目标"
+                                     "（回默认静音，无输入文件）")
+                else:
+                    notes.append("会话 r2 已重启并恢复现场")
+            else:
+                notes.append(f"复用常驻会话 {sid}"
+                             "（e 配置与分析状态保留，不重启 r2）")
+            # 已分析的同文件同模式会话：直接复用，秒开（含缓存命中标注）。
+            # respawn 除外：新 r2 必须走下方 debug 流程做现场 aaa（#43）。
+            if sess.cur_file == path and sess.analyzed and not respawned:
+                self.active_sid = sid
+                sess.last_used = time.time()
+                dt = time.time() - t0
+                hit = "缓存命中，" if sess.cache_hit else ""
+                mode_txt = ""
+                if sess.debug:
+                    mode_txt = "调试会话（拉起式，目标已启动并停在 r2 初始断点），"
+                return success_out([
+                    f"已打开 {path}（{mode_txt}{hit}复用常驻会话，分析状态与 e 配置保留）",
+                    f"耗时 {dt:.2f}s | r2: {self.version}"])
+
+        self.active_sid = sid
+        sess.last_used = time.time()
+
+        # v2.1 #42：账本与目标模式保持一致；static 会话忽略 stdin_file。
+        sess.stdin_file = stdin_file if want_debug else None
+
+        # ---- v2 debug 打开流程（新建 / static→debug 切换 / debug 复活后统一）----
+        if want_debug:
+            sess.debug = True
+            sess.cur_file = path
+            sess.cache_hit = False
+            # 保守照发 pager（与 static 同），随后校验 -d 当前 bin。
+            out, timed_out = sess.r2.cmd("e scr.pager=cat", 10)
+            if timed_out or not sess.r2.alive():
+                return self._resp_r2_dead(sess, "调试会话设置 pager")
+            if not self.verify_current_file(sess, path):
+                return {"ok": False, "code": 1, "out":
+                        f"调试打开失败：i~file 未指向目标 {path}。"
+                        "（r2 -d 拉起失败或文件不可调试）"}
+            # econf 与模式无关直接复用；agent 设过的 `e dbg.*` 也按名常驻重放。
+            self._apply_econf(sess)
+
+            analysis_cmd = ""
+            if analyze:
+                cmd, err = self._debug_aaa(sess, bigfile_limit)
+                analysis_cmd = cmd
+                if err:
+                    return self._resp_r2_dead(
+                        sess, f"调试分析命令 {cmd or 'aaa'}",
+                        timed_out=(err == "timeout"))
+                if sess.bigfile_downgraded:
+                    size = os.path.getsize(path)
+                    limit = bigfile_limit or env_int("R3_BIGFILE_LIMIT",
+                                                     DEFAULT_BIGFILE_LIMIT)
+                    notes.append(
+                        f"文件 {size} 字节 > 阈值 {limit}，调试分析已用轻量 aa，"
+                        '如需全量请手动 r3 "aaa"')
+            else:
+                sess.analyzed = False
+                notes.append("已按 --no-analyze 打开：调试会话未分析"
+                             "（调试分析不落盘工程缓存）")
+
+            # debug 不写 meta，但 state.json 必须存 debug 字段供 daemon 重启恢复模式。
+            key = cache_key(path, self.version)
+            self._save_state_with_key(sess, path, key)
+            dt = time.time() - t0
+            head = (f"已打开 {path}（调试会话，拉起式 r2 -d；"
+                    "目标已启动并停在 r2 初始断点）\n"
+                    f"耗时 {dt:.2f}s | r2: {self.version}")
+            if analyze:
+                head += (f" | 调试分析完成（{analysis_cmd}，仅会话内存，"
+                         "不落 Ps/meta）")
+            return success_out([head])
+
+        # ---- static 打开流程（现状；新建 / debug→static 切换 / 复活后统一）----
+        sha = file_sha256(path)
+        key = cache_key(path, self.version)
+        pd = self._projects_dir()
+        projdir = os.path.join(pd, key) if pd else None
+        meta_path = meta_path_for(projdir) if projdir else None
+
+        meta = self._load_meta(meta_path) if not self.memory_mode else None
+
+        # ② 缓存命中判定：工程文件存在 + meta 归属校验（内容 sha256 + path，v1.3 #24）。
+        #    v1 旧缓存无 meta / v1.2 旧 key → 自动作废走未命中路径。
+        if (not self.memory_mode and projdir and os.path.isfile(projdir)
+                and meta and meta.get("sha256") == sha
+                and meta.get("path") == path):
+            out, timed_out = sess.r2.cmd(f"Po {projdir}", 120)
+            if timed_out or not sess.r2.alive():
+                return self._resp_r2_dead(sess, "Po 缓存工程")
+            # Po 后重设 pager（r2 某些操作可能重置），再重放 e 配置（v1.3 #25）。
+            # 先标记 cur_file：_apply_econf 按 cur_file 读对应 econf 文件。
+            sess.cur_file = path
+            sess.r2.cmd("e scr.pager=cat", 10)
+            self._apply_econf(sess)
+            if not self.verify_current_file(sess, path):
+                # 工程恢复出来的不是目标文件（异常缓存）→ 回退为重新打开，不分析
+                out, timed_out = sess.r2.cmd(f"o {path}", 120)
+                if timed_out or not sess.r2.alive():
+                    return self._resp_r2_dead(sess, f"打开 {path}")
+                sess.cur_file = path
+                sess.r2.cmd("e scr.pager=cat", 10)
+                self._apply_econf(sess)
+                sess.analyzed, sess.cache_hit = False, False
+                sess.bigfile_downgraded = False
+                self._save_state_with_key(sess, path, key)
+                dt = time.time() - t0
+                return success_out([
+                    f"已打开 {path}（缓存校验失败，已回退为重新打开，未分析）",
+                    f"耗时 {dt:.2f}s | r2: {self.version}"])
+            sess.cur_file, sess.analyzed, sess.cache_hit = path, True, True
+            sess.bigfile_downgraded = False
+            self._save_state_with_key(sess, path, key)
+            dt = time.time() - t0
+            head = f"已打开 {path}（缓存命中，r2 工程秒开）"
+            if mode_switched:
+                head += "；会话已切换为静态模式"
+            return success_out([
+                head,
+                f"耗时 {dt:.2f}s | r2: {self.version}"])
+
+        # ③ 未命中：有工程文件但 meta 缺失/不符/path 不匹配 = 脏缓存，删除后
+        #    重新分析（决策 #10 + v1.3 #24）
+        if not self.memory_mode:
+            n = self._delete_dirty_cache(projdir)
+            if n:
+                notes.append(
+                    f"检测到脏缓存（meta 缺失或 sha256/path 不符），"
+                    f"已删除 {n} 个残留并重新分析")
+
+        out, timed_out = sess.r2.cmd(f"o {path}", 120)
+        if timed_out or not sess.r2.alive():
+            return self._resp_r2_dead(sess, f"打开 {path}")
+        # r2 的 o 会重置 pager，必须重设（否则 izz 等长输出会挂 stdin）
+        sess.r2.cmd("e scr.pager=cat", 10)
+        if not self.verify_current_file(sess, path):
+            return {"ok": False, "code": 1, "out":
+                    f"打开失败：当前文件不是目标 {path}（i~file 校验未通过）。"
+                    "未分析、未落缓存，请检查文件是否可正常打开"}
+        sess.cur_file, sess.cache_hit = path, False
+        sess.bigfile_downgraded = False
+        # v1.3 #25：o + pager 之后、分析之前重放 e 配置（重开/首次 open 都覆盖）
+        self._apply_econf(sess)
+
+        analysis_cmd = ""
+        if analyze:
+            size = os.path.getsize(path)
+            limit = bigfile_limit or env_int("R3_BIGFILE_LIMIT",
+                                             DEFAULT_BIGFILE_LIMIT)
+            analysis_cmd = "aaa"
+            if size > limit:
+                analysis_cmd = "aa"  # 大文件降级为轻量分析
+                sess.bigfile_downgraded = True
+                notes.append(
+                    f"文件 {size} 字节 > 阈值 {limit}，大文件已用轻量分析，"
+                    '如需全量请手动 r3 "aaa"')
+            out, timed_out = sess.r2.cmd(analysis_cmd,
+                                         env_int("R3_CMD_TIMEOUT",
+                                                 DEFAULT_CMD_TIMEOUT))
+            if timed_out or not sess.r2.alive():
+                return self._resp_r2_dead(sess, f"分析命令 {analysis_cmd}")
+            sess.analyzed = True
+            if not self.memory_mode:
+                # 分析后再校验一次，失败不落缓存（防污染固化，v1 缺陷①连带问题）
+                if not self.verify_current_file(sess, path):
+                    return {"ok": False, "code": 1, "out":
+                            f"分析后校验失败：当前文件不是目标 {path}。"
+                            "未落缓存，请重新 open"}
+                # 实测：Ps 存精确路径文件，不自动加 .r2 后缀；前提是目标路径
+                # 不存在——只需保证父目录存在（预创建目录会导致 git init 失败）。
+                try:
+                    os.makedirs(pd, exist_ok=True)
+                except OSError:
+                    # 目录中途变只读/不可创建 → 降级内存模式，跳过落盘
+                    self._degrade_memory("projects 目录不可创建")
+                if not self.memory_mode:
+                    out, timed_out = sess.r2.cmd(f"Ps {projdir}", 300)
+                    if timed_out or not sess.r2.alive():
+                        return self._resp_r2_dead(sess, "Ps 保存工程")
+                    # Ps 成功之后才写 meta（顺序保证：无 meta = 未完成 = 下次重分析）
+                    self._write_meta(meta_path, key, path, sha, analysis_cmd)
+        else:
+            sess.analyzed = False
+            notes.append("已按 --no-analyze 打开：未分析、未落缓存工程")
+
+        self._save_state_with_key(sess, path, key)
+        dt = time.time() - t0
+        head = f"已打开 {path}（{self.version}）"
+        if mode_switched:
+            head += "；会话已切换为静态模式"
+        head += f"\n耗时 {dt:.2f}s"
+        if analyze:
+            head += f" | 分析完成（{analysis_cmd}）"
+            if self.memory_mode:
+                head += " | 纯内存模式，未落盘"
+            else:
+                head += f" | 工程已缓存到 {projdir}"
+        return success_out([head])
+
+    @staticmethod
+    def _mark_rebuilt(sess):
+        """r2 重建成功后清掉“启动失败待重开”标记（v2.1 #41）。"""
+        sess.startup_failed = False
+        sess.fail_reason = None
+
+    def _rebuild_session_r2(self, sess):
+        """按会话当前模式重建 r2 并恢复现场（v2.1 #41 自愈共用路径）。
+
+        普通命令命中 r2=None 的待重开会话、看门狗超时、r2 崩溃、boot 恢复
+        失败后的下次命令，都走这里。返回 None 表示重建成功；返回错误 dict
+        时已置 startup_failed/fail_reason，调用方直接透出。
+        """
+        if sess.r2 is not None:
+            try:
+                sess.r2.kill()
+            except Exception:
+                pass
+            sess.r2 = None
+        try:
+            # v2 #35 + v2.1 #42：按 sess.debug 重建；debug 保持 stdin_file 注入。
+            sess.r2 = R2Process(
+                debug=sess.debug,
+                path=sess.cur_file if sess.debug else None,
+                stdin_file=sess.stdin_file if sess.debug else None)
+        except (RuntimeError, ValueError) as e:
+            sess.r2 = None
+            sess.startup_failed = True
+            sess.fail_reason = str(e)
+            return {"ok": False, "code": 1,
+                    "reason": str(e),
+                    "out": f"r2 重启失败: {e}\n"
+                           "会话已标记为[启动失败待重开]；"
+                           "下次命令或重新 open 会自动重建"}
+        self._mark_rebuilt(sess)
+        try:
+            self._restore_session_file(sess)
+            if sess.debug and sess.analyzed:
+                # 触发自愈后的 debug 现场 aaa 固定用 DEFAULT_CMD_TIMEOUT，
+                # 不继承本次请求的小 timeout（v2 #35）。
+                cmd, err = self._debug_aaa(sess)
+                if err:
+                    log(f"session {sess.sid} debug re-aaa after self-heal "
+                        f"failed ({cmd}: {err})")
+        except Exception as e:
+            log(f"session {sess.sid} restore after rebuild failed: {e}")
+        return None
+
+    def _resp_r2_dead(self, sess, what, timed_out=True):
+        """会话 r2 死亡/超时后的自愈：重启该会话的 r2、恢复该文件现场，
+        并向客户端明确报告（带结构化字段，决策 #18）。"""
+        rebuild_err = self._rebuild_session_r2(sess)
+        if rebuild_err is not None:
+            reason = rebuild_err.get("reason") or rebuild_err.get("out", "")
+            resp = {"ok": False, "code": 3, "timed_out": timed_out,
+                    "out": f"⚠️ {what} 时 r2 无响应且重启失败: {reason}"}
+            if not timed_out:
+                resp["error"] = "r2_crashed"
+            return resp
+        if not what.endswith("超时") and "超时" not in what:
+            what += " 时 r2 无响应（超时或崩溃）"
+        mode_txt = "（调试会话）" if sess.debug else ""
+        resp = {"ok": False, "code": 3,
+                "out": f"⚠️ 命令超时/失败（{what}），r2 已重启并恢复现场{mode_txt}。"
+                       f"当前文件: {sess.cur_file or '无'}。可重试或调大 R3_CMD_TIMEOUT。"}
+        if timed_out:
+            resp["timed_out"] = True
+        else:
+            resp["error"] = "r2_crashed"
+        return resp
+
+    # ---- status（v1.2 #18：structured=True 输出 JSON）----
+
+    def status(self, structured=False):
+        # v1.1 修正：按"工程文件（isfile，不含 meta）"计数——v1 把目录也计进
+        # 工程数（n_projects - 1 的 hack），cache-clean 后显示不准。
+        pd = self._projects_dir()
+        n_projects, cache_bytes = 0, 0
+        if pd and os.path.isdir(pd):
+            try:
+                entries = os.listdir(pd)
+            except OSError:
+                entries = []
+            for fn in entries:
+                full = os.path.join(pd, fn)
+                try:
+                    if os.path.isfile(full) and not fn.endswith(".meta.json"):
+                        n_projects += 1
+                        cache_bytes += os.path.getsize(full)
+                    elif os.path.isdir(full):
+                        for root, _dirs, files in os.walk(full):
+                            for f in files:
+                                try:
+                                    cache_bytes += os.path.getsize(
+                                        os.path.join(root, f))
+                                except OSError:
+                                    pass
+                except OSError:
+                    pass
+        active = self.sessions.get(self.active_sid) if self.active_sid else None
+        file_sessions = self._file_sessions()
+
+        if structured:
+            # 决策 #18：结构化元信息（命令输出本体原样透传；这里输出的是元信息）
+            fb = None
+            if self.cache_reason and (
+                    self.cache_reason.startswith("回退")
+                    or self.cache_reason.startswith("restart")):
+                fb = self.cache_reason
+            return {
+                "ok": True, "code": 0,
+                "daemon": {"pid": os.getpid(),
+                           "r3_version": R3_VERSION,
+                           "uptime_s": round(time.time() - self.started_at, 1),
+                           "r2_version": self.version},
+                "active_session": self.active_sid,
+                "sessions": [
+                    {"sid": s.sid, "file": s.cur_file, "debug": s.debug,
+                     "stdin_file": s.stdin_file,
+                     "startup_failed": bool(s.startup_failed),
+                     "analyzed": s.analyzed, "cache_hit": s.cache_hit,
+                     "bigfile_downgraded": s.bigfile_downgraded}
+                    for s in file_sessions],
+                "cache": {"mode": "memory" if self.memory_mode else "disk",
+                          "path": self.cache_dir,
+                          "fallback_reason": fb,
+                          "projects": n_projects, "bytes": cache_bytes},
+            }
+
+        # v1.1.x 三件信息：磁盘/内存模式 + 最终生效绝对路径 + 回退原因
+        if self.memory_mode:
+            mode_line = ("内存模式（无落盘缓存"
+                         + ("，R3_NO_CACHE=1）" if NO_CACHE else "）"))
+            loc_line = "（无，纯内存兜底）"
+        else:
+            mode_line = "磁盘缓存"
+            loc_line = self.cache_dir
+        lines = [
+            "r3 daemon 运行中",
+            f"  r3 版本        : {R3_VERSION}",
+            f"  r2 版本        : {self.version}",
+            f"  daemon 存活    : {time.time() - self.started_at:.0f}s "
+            f"(pid {os.getpid()})",
+            f"  当前会话       : {self.active_sid or '（无）'}",
+            f"  当前文件       : {active.cur_file if active and active.cur_file else '（无）当前无文件打开'}",
+        ]
+        if active and active.cur_file:
+            lines.append(f"  已分析         : {active.analyzed}"
+                         + ("（缓存命中）" if active.cache_hit else ""))
+            if active.debug:
+                lines.append("  调试模式       : True"
+                             "（拉起式 r2 -d；attach 受内核 yama 限制不可用）")
+            if active.startup_failed:
+                lines.append("  启动失败待重开 : True"
+                             "（上次拉起失败；下次命令或重新 open 会自动重建）")
+        else:
+            lines.append("  已分析         : False")
+        if active and active.bigfile_downgraded:
+            lines.append("  注意           : 当前文件曾用轻量分析（aa）打开")
+        lines += [
+            f"  缓存模式       : {mode_line}",
+            f"  缓存位置       : {loc_line}",
+            f"  回退原因       : {self.cache_reason or '（未解析）'}",
+            f"  会话           : {len(file_sessions)} 个（r3 sessions 查看）",
+        ]
+        for s in file_sessions:
+            tag = f"{s.sid}  {s.cur_file}"
+            if s.debug:
+                tag += "  [调试]"
+            if s.stdin_file is not None:
+                tag += f"  [输入文件: {s.stdin_file}]"
+            if s.startup_failed:
+                tag += "  [启动失败待重开]"
+            if s.analyzed:
+                tag += "  [已分析]"
+            if s.cache_hit:
+                tag += "  [缓存命中]"
+            if s.bigfile_downgraded:
+                tag += "  [轻量]"
+            lines.append(f"    {tag}")
+        lines += [
+            f"  缓存工程       : {n_projects} 个，"
+            f"共 {cache_bytes / 1048576:.1f} MB"
+            f"（{pd or '（纯内存，无缓存目录）'}）",
+            f"  最近命令       :",
+        ]
+        if active and active.recent:
+            lines.extend(f"    {c}" for c in active.recent)
+        else:
+            lines.append("    （无）")
+        return {"ok": True, "code": 0, "out": "\n".join(lines)}
+
+    # ---- sessions / close（v1.2 #15/#16）----
+
+    def list_sessions(self, structured=False):
+        file_sessions = self._file_sessions()
+        if structured:
+            return {"ok": True, "code": 0, "sessions": [
+                {"sid": s.sid, "file": s.cur_file, "debug": s.debug,
+                 "stdin_file": s.stdin_file,
+                 "startup_failed": bool(s.startup_failed),
+                 "analyzed": s.analyzed, "cache_hit": s.cache_hit,
+                 "bigfile_downgraded": s.bigfile_downgraded}
+                for s in file_sessions]}
+        if not file_sessions:
+            out = "（无已打开文件的会话）"
+        else:
+            lines = [f"会话列表（{len(file_sessions)} 个）:"]
+            for s in file_sessions:
+                tag = f"{s.sid}  {s.cur_file}"
+                if s.debug:
+                    tag += "  [调试]"
+                if s.stdin_file is not None:
+                    tag += f"  [输入文件: {s.stdin_file}]"
+                if s.startup_failed:
+                    tag += "  [启动失败待重开]"
+                if s.analyzed:
+                    tag += "  [已分析]"
+                if s.cache_hit:
+                    tag += "  [缓存命中]"
+                lines.append(tag)
+            out = "\n".join(lines)
+        return {"ok": True, "code": 0, "out": out}
+
+    def close_session(self, target=None):
+        """释放指定/当前会话的 r2 进程（不删磁盘缓存，决策 #15）。"""
+        sid, err = None, None
+        if target:
+            sid, err = self._resolve_sid(target)
+            if err:
+                # v1.3.1：目标解析失败 → 退出码 6；无当前会话 → 退出码 5。
+                error = ("session_ambiguous" if "歧义" in err
+                         else "session_not_found")
+                return {"ok": False, "code": 6, "out": err,
+                        "error": error}
+        else:
+            sid = self.active_sid
+        sess = self.sessions.get(sid) if sid else None
+        if sess is None:
+            code = 5 if not target else 6
+            error = "no_active_session" if not target else "session_not_found"
+            return {"ok": False, "code": code,
+                    "out": (f"会话不存在或已关闭: {target or sid}"
+                            if target else
+                            "无当前会话：请先 r3 open <文件> 指定会话"),
+                    "error": error}
+        if sess.r2 is not None:
+            try:
+                sess.r2.kill()
+            except Exception:
+                pass
+        del self.sessions[sid]
+        if self.active_sid == sid:
+            self.active_sid = None
+        return {"ok": True, "code": 0,
+                "out": f"会话已关闭: {sess.cur_file or sid}"
+                       "（磁盘缓存保留；r3 sessions 查看剩余会话）"}
+
+    # ---- cache-clean（v1.1 决策 #13）----
+
+    def cache_clean(self):
+        """删除全部工程缓存（<key> 文件 + <key>.d 目录 + meta）+ econf/
+        + state.json（v1.3 #25）。
+
+        实测（§3.4）：Ps 会同时生成工程文件与 .d 目录，两者都要删。
+        只清磁盘缓存，不影响当前会话（r2 进程仍抱着当前文件）。
+        """
+        if self.memory_mode:
+            return {"ok": True, "code": 0,
+                    "out": "内存模式：无落盘缓存可清理"}
+        pd = self._projects_dir()
+        sp = self._state_path()
+        n = 0
+        if pd and os.path.isdir(pd):
+            try:
+                entries = os.listdir(pd)
+            except OSError:
+                entries = []
+            for fn in entries:
+                full = os.path.join(pd, fn)
+                try:
+                    if os.path.isdir(full) and not os.path.islink(full):
+                        shutil.rmtree(full)
+                    else:
+                        os.unlink(full)
+                    n += 1
+                except OSError:
+                    log(f"cache_clean: failed to remove {full}")
+        ec = os.path.join(self.cache_dir, "econf") if self.cache_dir else None
+        if ec and os.path.isdir(ec):
+            try:
+                shutil.rmtree(ec)
+            except OSError:
+                log(f"cache_clean: failed to remove {ec}")
+        for p in (sp, sp + ".tmp" if sp else None):
+            try:
+                if p and os.path.exists(p):
+                    os.unlink(p)
+            except OSError:
+                pass
+        return {"ok": True, "code": 0,
+                "out": f"已清理 {n} 个缓存条目：全部工程缓存（含 .d 目录与 meta）、"
+                       "econf/ 与 state.json 均已删除"}
+
+    # ---- 透传 ----
+
+    def passthrough(self, sess, command, timeout):
+        first = command.strip().split()[0] if command.strip() else ""
+        # 交互式命令黑名单：直接拒绝，防止把管道挂死（CLI 退出码 2）
+        if first in INTERACTIVE_BLACKLIST:
+            return {"ok": False, "code": 2, "rejected": True, "out":
+                    f"已拒绝：'{first}' 是交互式命令（visual 模式会霸占终端、"
+                    "把 daemon 的 r2 管道挂死）。请用非交互命令，"
+                    "例如 pd/pdf/afl/izz。"}
+        # v2.1 #41：模式切换失败会把 r2 置 None 并标待重开；普通命令命中时
+        # 先按旧模式自动重建，成功后继续执行本条命令（无需 agent 手动处理）。
+        if sess.r2 is None:
+            rebuild_err = self._rebuild_session_r2(sess)
+            if rebuild_err is not None:
+                sess.recent.append(f"{command}  [自愈重建失败]")
+                return rebuild_err
+            sess.recent.append(f"{command}  [自愈重建成功]")
+        # v1.3 #25：旁路记录 `e 名=值`（只识别、不改写命令与输出）。
+        # 先落盘再执行——即使执行中超时/崩溃，配置也已被记录下来供自愈重放。
+        name = e_cmd_name(command)
+        if name:
+            sess.e_cmds[name] = command   # 按名去重，后设覆盖
+            self._save_econf(sess)
+
+        out, timed_out = sess.r2.cmd(command, timeout)
+        if timed_out:
+            resp = self._resp_r2_dead(sess, f"{command!r} 超时")
+            sess.recent.append(f"{command}  [超时→r2已重启]")
+            return resp
+        if out is None:  # r2 崩了
+            resp = self._resp_r2_dead(sess, f"{command!r} 执行中 r2 崩溃",
+                                      timed_out=False)
+            sess.recent.append(f"{command}  [r2崩溃→已重启]")
+            return resp
+        sess.recent.append(command)
+        return {"ok": True, "code": 0,
+                "out": out.decode("utf-8", "replace")}
+
+    # ---- socket 服务 ----
+
+    def serve(self):
+        # 已有活 daemon 在跑就直接退（懒启动竞态兜底）
+        if _sock_ping():
+            log("another daemon already serving, exit")
+            return
+        if os.path.exists(SOCK_PATH):
+            os.unlink(SOCK_PATH)
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(SOCK_PATH)
+        os.chmod(SOCK_PATH, 0o600)   # socket 权限 600（PLAN §8）
+        srv.listen(8)
+        self._boot_restore()
+        log(f"daemon up (pid {os.getpid()}), r2: {self.version}")
+        print(f"r3 daemon started (pid {os.getpid()})", flush=True)
+        try:
+            while True:
+                conn, _ = srv.accept()
+                try:
+                    with conn:
+                        conn.settimeout(30)
+                        data = b""
+                        while b"\n" not in data:
+                            chunk = conn.recv(65536)
+                            if not chunk:
+                                break
+                            data += chunk
+                        if not data:
+                            continue
+                        req = json.loads(data.decode("utf-8"))
+                        resp = self.dispatch(req)
+                        conn.sendall(
+                            (json.dumps(resp) + "\n").encode("utf-8"))
+                        if req.get("action") == "die":
+                            log("die: shutting down")
+                            return
+                except Exception as e:
+                    log(f"request error: {e}")
+        finally:
+            srv.close()
+            if os.path.exists(SOCK_PATH):
+                os.unlink(SOCK_PATH)
+            # v1.2：退出前释放所有会话的 r2 进程（不删磁盘缓存）
+            for s in self.sessions.values():
+                if s.r2 is not None:
+                    try:
+                        s.r2.kill()
+                    except Exception:
+                        pass
+            log("daemon down")
+
+    def dispatch(self, req):
+        action = req.get("action", "pass")
+        # 请求带的覆盖值优先于 daemon 自身环境变量（见文件头"事实类偏差"说明）
+        timeout = req.get("timeout") or env_int("R3_CMD_TIMEOUT",
+                                                DEFAULT_CMD_TIMEOUT)
+        try:
+            if action == "die":
+                log("die requested")
+                return {"ok": True, "code": 0, "out": "daemon 已停止"}
+            if action == "open":
+                mode = OpenMode(req.get("mode", "static"))
+                return self.open_file(
+                    req.get("path", ""), mode=mode,
+                    analyze=bool(req.get("analyze", True)),
+                    bigfile_limit=req.get("bigfile"),
+                    gitignore=bool(req.get("gitignore")),
+                    stdin_file=req.get("stdin_file"))
+            if action == "list":
+                return self.list_sessions(structured=bool(req.get("json")))
+            if action == "close":
+                return self.close_session(req.get("target"))
+            if action == "status":
+                return self.status(structured=bool(req.get("json")))
+            if action == "cache_clean":
+                return self.cache_clean()
+            # pass：显式 sid（--session 目标串）→ daemon 解析（决策 #16）；
+            # 未传 / 旧客户端硬编码 "default" → 落回 active_sid（§3.5 兼容）。
+            sid = req.get("sid")
+            if sid and sid != FILELESS_SID:
+                sid, err = self._resolve_sid(sid)
+                if err:
+                    # v1.3.1：会话目标解析失败单列退出码 6，不再混用
+                    # “1 = daemon/连接故障”的语义。
+                    error = ("session_ambiguous" if "歧义" in err
+                             else "session_not_found")
+                    return {"ok": False, "code": 6, "out": err,
+                            "error": error}
+            else:
+                sid = self.active_sid
+            sess = self.sessions.get(sid) if sid else None
+            if sess is None:
+                # v1.3 #27：无当前会话不再懒建无文件 r2，安全报错退出码 5。
+                return {"ok": False, "code": 5,
+                        "error": "no_active_session",
+                        "out": "无当前会话：请先 r3 open <文件> 或 "
+                               "r3 --session <目标> 指定会话"
+                               "（r3 sessions 查看已开会话）"}
+            # 带 --session 的调用更新 active_sid（PLAN-v1.2 §3.5）
+            if req.get("sid"):
+                self.active_sid = sess.sid
+            sess.last_used = time.time()
+            return self.passthrough(sess, req.get("cmd", ""), timeout)
+        except Exception as e:
+            log(f"dispatch error: {e!r}")
+            return {"ok": False, "code": 1, "out": f"daemon 内部错误: {e!r}",
+                    "error": "daemon_error"}
+
+
+def _sock_ping():
+    """socket 上是否已有活 daemon。"""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        s.connect(SOCK_PATH)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def run_daemon():
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, _handle_term)
+    Daemon().serve()
+
+
+def _handle_term(signum, frame):
+    if os.path.exists(SOCK_PATH):
+        try:
+            os.unlink(SOCK_PATH)
+        except OSError:
+            pass
+    sys.exit(0)
+
+
+# ---------------------------------------------------------------- 客户端
+
+class R3ConnError(Exception):
+    """连接级故障（v1.2 决策 #22 三类区分）。
+
+    code ∈ daemon_not_running / daemon_refused / daemon_timeout / daemon_error。
+    """
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def talk(req, allow_spawn=True):
+    """连 daemon 发请求收响应；连不上则懒启动 daemon 再试（PLAN §3）。
+
+    v1.2（决策 #22）：最终失败按底层异常分类——socket 不存在 →
+    daemon_not_running；存在但拒连 → daemon_refused；读写超时 →
+    daemon_timeout（不自动重试）。其余归 daemon_error。退出码统一由 CLI 给 1。
+    """
+    attempts = 2 if allow_spawn else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(max(LAZY_START_WAIT, env_int("R3_CMD_TIMEOUT",
+                                                      DEFAULT_CMD_TIMEOUT)) + 60)
+            s.connect(SOCK_PATH)
+            s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+            buf = b""
+            while b"\n" not in buf:
+                chunk = s.recv(1 << 20)
+                if not chunk:
+                    break
+                buf += chunk
+            s.close()
+            if not buf:
+                raise R3ConnError("daemon_error", "daemon 关闭了连接且无响应")
+            return json.loads(buf.decode("utf-8"))
+        except (socket.timeout, TimeoutError) as e:
+            raise R3ConnError(
+                "daemon_timeout",
+                f"daemon 无响应（读写超时 {e!r}），建议 r3 kill 后重试")
+        except FileNotFoundError as e:
+            if attempt < attempts:
+                spawn_daemon()
+                continue
+            raise R3ConnError(
+                "daemon_not_running",
+                f"daemon 未运行（socket 不存在: {SOCK_PATH}），拉起失败")
+        except ConnectionRefusedError as e:
+            if attempt < attempts:
+                spawn_daemon()
+                continue
+            raise R3ConnError(
+                "daemon_refused",
+                f"daemon 存在但拒连（可能启动中）: {e!r}，建议 r3 restart")
+        except (ConnectionError, OSError) as e:
+            if attempt < attempts:
+                spawn_daemon()
+                continue
+            raise R3ConnError("daemon_error", f"连接 daemon 失败: {e!r}")
+        except ValueError as e:
+            raise R3ConnError("daemon_error", f"daemon 响应无法解析: {e!r}")
+    raise R3ConnError("daemon_error", "unreachable")
+
+
+def spawn_daemon():
+    """懒启动：脱离终端后台再跑一次自己，日志重定向到 daemon.log。
+
+    v1.1 容错（§3.2 实测复现）：缓存目录不可写时 open(LOG_PATH) 抛
+    PermissionError 会直接让 daemon 拉不起来——必须 try/except，失败时
+    stdout/stderr 用 DEVNULL。daemon 子进程天然继承环境变量，路径类配置
+    （R3_CACHE_DIR/R3_SOCK_PATH/R3_NO_CACHE/XDG_CACHE_HOME）无需显式传递。
+    日志路径按回退链解析（锚点未知的两级链），与 daemon 启动时一致。
+    """
+    log("lazy-start: spawning daemon")
+    lf = None
+    try:
+        d, _reason = resolve_cache_dir(None)
+        if not d:
+            out_dev = subprocess.DEVNULL
+        else:
+            lf = open(os.path.join(d, "daemon.log"), "a",
+                      encoding="utf-8", errors="replace")
+            out_dev = lf
+    except OSError:
+        out_dev = subprocess.DEVNULL
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.realpath(__file__), "__daemon"],
+            stdout=out_dev, stderr=out_dev, stdin=subprocess.DEVNULL,
+            start_new_session=True)  # 脱离终端
+    finally:
+        if lf is not None:
+            lf.close()
+    deadline = time.time() + LAZY_START_WAIT
+    while time.time() < deadline:
+        if _sock_ping():
+            return
+        time.sleep(0.1)
+
+
+def truncate(out, limit, cmd):
+    """默认截断 + 自救提示（PLAN §6）。返回 (输出, 是否真截断)——退出码 4 的依据
+    （v1.2 决策 #21）。R3_MAX_OUT 在 CLI 侧读取。"""
+    if len(out) <= limit:
+        return out, False
+    return out[:limit] + TRUNCATE_BANNER.format(n=limit).replace("<cmd>", cmd), True
+
+
+def _cli_error(code, message, json_flag, exit_code=1):
+    """CLI 错误输出（决策 #22）：--json 结构化，无 --json 自然语言带分类词。"""
+    if json_flag:
+        print(json.dumps({"ok": False, "error": code, "message": message},
+                         ensure_ascii=False))
+    else:
+        print(f"无法连接/拉起 daemon（{code}）: {message}")
+    return exit_code
+
+
+def normalize_target(t):
+    """调用方 cwd 语义（v1.3 决策 #23）：路径样目标绝对化；纯裸名保留作
+    basename 别名。os.path.realpath 不要求文件存在，daemon 存在性检查不受影响。
+    """
+    t = os.path.expanduser(t)
+    if os.path.isabs(t):
+        return os.path.realpath(t)
+    if "/" in t:                      # 含分隔符 = 路径样，按调用方 cwd 解释
+        return os.path.realpath(os.path.abspath(t))
+    return t                          # 裸名：原样发送，daemon 当别名
+
+
+def cli_main(argv):
+    args = list(argv)
+    full = False
+    json_flag = False
+    session_target = None
+    # 全局开关（v1.2）：--full / --json / --session <目标>，可在命令前后任意位置
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--full":
+            full = True
+            del args[i]
+        elif a == "--json":
+            json_flag = True
+            del args[i]
+        elif a == "--session":
+            if i + 1 >= len(args):
+                print("用法: r3 --session <路径或别名> <命令>")
+                return 1
+            session_target = normalize_target(args[i + 1])
+            del args[i:i + 2]
+        else:
+            i += 1
+
+    if not args:
+        print(USAGE.format(max_out=env_int("R3_MAX_OUT", DEFAULT_MAX_OUT),
+                           version=R3_VERSION))
+        return 0
+
+    cmd0 = args[0]
+
+    if cmd0 == "__daemon":          # 内部子命令：daemon 就是它自己后台再跑一次
+        run_daemon()
+        return 0
+
+    if cmd0 == "help":
+        print(USAGE.format(max_out=env_int("R3_MAX_OUT", DEFAULT_MAX_OUT),
+                           version=R3_VERSION))
+        return 0
+
+    if cmd0 == "kill":
+        try:
+            resp = talk({"action": "die"})
+        except R3ConnError:
+            print("daemon 未在运行")
+            return 0
+        # 给 daemon 一点时间自我了断并清掉 socket 文件
+        deadline = time.time() + 3
+        while time.time() < deadline and _sock_ping():
+            time.sleep(0.1)
+        print(resp.get("out", ""))
+        print("daemon 已停止（socket 已清除；下次任何 r3 调用会自动再拉起）")
+        return 0
+
+    if cmd0 == "restart":
+        # v1.3 #26：先问旧 daemon 的生效缓存目录（磁盘模式），杀 daemon 后以
+        # R3_CACHE_DIR 传给新 daemon——.r3cache 锚点随目录恢复，boot 恢复生效。
+        old_path = None
+        try:
+            r = talk({"action": "status", "json": True}, allow_spawn=False)
+            if r.get("ok") and r.get("cache", {}).get("mode") == "disk":
+                old_path = r["cache"].get("path")
+        except R3ConnError:
+            pass                            # daemon 未在运行，无旧路径可问
+        try:
+            talk({"action": "die"}, allow_spawn=False)
+        except R3ConnError:
+            print("daemon 原本未在运行")
+        deadline = time.time() + 3
+        while time.time() < deadline and _sock_ping():
+            time.sleep(0.1)
+        if old_path:
+            os.environ["R3_CACHE_DIR"] = old_path  # 本进程及其 spawn 的子 daemon 继承
+            os.environ["R3_CACHE_REASON_OVERRIDE"] = (
+                "restart 沿用上次生效缓存目录")
+        # 触发懒启动；daemon 启动即按 state.json + 缓存自动恢复上次现场
+        try:
+            resp = talk({"action": "status"})
+            print("daemon 已重启并尝试恢复上次现场：\n" + resp.get("out", ""))
+            if old_path:
+                print(f"已沿用缓存目录 {old_path} 重启")
+            return 0
+        except R3ConnError as e:
+            return _cli_error(e.code, e.message, json_flag)
+
+    if cmd0 == "open":
+        usage_line = ("用法: r3 open <文件路径> [--no-analyze] [--gitignore] "
+                      "[--debug [--stdin <输入文件>]]")
+        rest = args[1:]
+        analyze = True
+        gitignore = False
+        debug = False
+        stdin_arg = None
+        # v2.1 #42：--stdin 取其后一个元素为值；缺失按用法错误处理。
+        if "--stdin" in rest:
+            i = rest.index("--stdin")
+            if i + 1 >= len(rest):
+                print(usage_line)
+                return 1
+            stdin_arg = rest[i + 1]
+            del rest[i:i + 2]
+        if "--no-analyze" in rest:
+            analyze = False
+            rest.remove("--no-analyze")
+        if "--gitignore" in rest:
+            gitignore = True
+            rest.remove("--gitignore")
+        if "--debug" in rest:
+            debug = True
+            rest.remove("--debug")
+        if stdin_arg is not None and not debug:
+            print("--stdin 仅可与 --debug 一起使用")
+            print(usage_line)
+            return 1
+        rest = [a for a in rest if a != "--"]
+        if len(rest) != 1:
+            print(usage_line)
+            return 1
+        req = {"action": "open", "path": normalize_target(rest[0]),
+               "analyze": analyze,
+               "mode": OpenMode.DEBUG.value if debug else OpenMode.STATIC.value,
+               "bigfile": env_int("R3_BIGFILE_LIMIT", DEFAULT_BIGFILE_LIMIT),
+               "gitignore": gitignore}
+        if stdin_arg is not None:
+            req["stdin_file"] = normalize_target(stdin_arg)
+        try:
+            resp = talk(req)
+        except R3ConnError as e:
+            return _cli_error(e.code, e.message, json_flag)
+        print(resp.get("out", ""))
+        return resp.get("code", 0)
+
+    if cmd0 == "status":
+        try:
+            resp = talk({"action": "status", "json": json_flag})
+        except R3ConnError as e:
+            return _cli_error(e.code, e.message, json_flag)
+        if json_flag and resp.get("ok"):
+            print(json.dumps(resp, ensure_ascii=False))
+            return 0
+        print(resp.get("out", ""))
+        return resp.get("code", 0)
+
+    if cmd0 == "sessions":
+        try:
+            resp = talk({"action": "list", "json": json_flag})
+        except R3ConnError as e:
+            return _cli_error(e.code, e.message, json_flag)
+        if json_flag:
+            if resp.get("ok"):
+                print(json.dumps(resp.get("sessions", []), ensure_ascii=False))
+            else:
+                print(json.dumps({"ok": False, "error": "daemon_error",
+                                  "message": resp.get("out", "")},
+                                 ensure_ascii=False))
+            return resp.get("code", 0)
+        print(resp.get("out", ""))
+        return resp.get("code", 0)
+
+    if cmd0 == "close":
+        if len(args) > 2:
+            print("用法: r3 close [<目标>]")
+            return 1
+        req = {"action": "close"}
+        target = args[1] if len(args) == 2 else session_target
+        if target:
+            req["target"] = normalize_target(target)
+        try:
+            resp = talk(req)
+        except R3ConnError as e:
+            return _cli_error(e.code, e.message, json_flag)
+        print(resp.get("out", ""))
+        return resp.get("code", 0)
+
+    if cmd0 == "cache-clean":
+        try:
+            resp = talk({"action": "cache_clean"})
+        except R3ConnError as e:
+            return _cli_error(e.code, e.message, json_flag)
+        print(resp.get("out", ""))
+        return resp.get("code", 0)
+
+    # ---- 透传：其余一律按 r2 命令 ----
+    command = " ".join(args)
+    req = {"action": "pass", "cmd": command, "full": full,
+           "max_out": env_int("R3_MAX_OUT", DEFAULT_MAX_OUT),
+           "timeout": env_int("R3_CMD_TIMEOUT", DEFAULT_CMD_TIMEOUT)}
+    if session_target:
+        req["sid"] = session_target
+    try:
+        resp = talk(req)
+    except R3ConnError as e:
+        return _cli_error(e.code, e.message, json_flag)
+    out = resp.get("out", "")
+    # v1.2 决策 #19：废除「输出以 { 或 [ 开头即 JSON」启发式，改显式 --json。
+    # --json 承诺「不截断 + 原样完整」（不校验合法性）；--full 要全量；
+    # 两者正交（--json 隐含不截断）。截断发生时退出码 4（决策 #21）。
+    truncated = False
+    if resp.get("ok"):
+        if not json_flag and not full and len(out) > env_int(
+                "R3_MAX_OUT", DEFAULT_MAX_OUT):
+            out, truncated = truncate(out, env_int("R3_MAX_OUT",
+                                                  DEFAULT_MAX_OUT), command)
+    if not resp.get("ok") and json_flag:
+        # 元事件结构化（决策 #18/#22）：错误以 JSON 回执呈现
+        if resp.get("rejected"):
+            error = "rejected"
+        elif resp.get("timed_out"):
+            error = "timeout"
+        else:
+            error = resp.get("error", "daemon_error")
+        print(json.dumps({"ok": False, "error": error,
+                          "message": resp.get("out", "")},
+                         ensure_ascii=False))
+    else:
+        print(out)
+    if resp.get("ok"):
+        return 4 if truncated else 0
+    return resp.get("code", 1)
+
+
+if __name__ == "__main__":
+    sys.exit(cli_main(sys.argv[1:]))
